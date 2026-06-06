@@ -1,0 +1,55 @@
+# 复制为 config.toml，填入你的值
+# config.toml 被 .gitignore 排除
+
+[data]
+# 数据源项目地址
+base_dir = ""
+
+[backtest]
+start = "2026-02-03"
+end = "2026-02-09"
+decision_interval = 60  # 分钟
+max_decisions = 0       # 0=不限制
+
+[model]
+# 模型原名：mimo-v2.5-pro / deepseek-v4-pro
+name = "mimo-v2.5-pro"
+temperature = 0.3
+thinking_enabled = false  # 关闭 thinking 可大幅降低延迟和 token 消耗
+max_tokens = 4096
+timeout = 180
+
+[model.api]
+# 填入你的 API key
+mimo_v2_5_pro_api_key = ""
+mimo_v2_5_pro_base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+deepseek_v4_pro_api_key = ""
+deepseek_v4_pro_base_url = "https://api.deepseek.com"
+
+[portfolio]
+initial_cash = 100000
+
+[portfolio.position_limits]
+max_single = 0.25
+max_market = 0.50
+max_crypto = 0.25
+min_cash = 0.05
+
+[costs]
+cn_sell_tax_bps = 5
+fx_fee_bps = 5
+
+[costs.commission_bps]
+US = 3
+HK = 5
+CN = 3
+CRYPTO = 10
+
+[costs.slippage_bps]
+US = 5
+HK = 5
+CN = 5
+CRYPTO = 10
+
+[agent]
+max_rounds = 8
