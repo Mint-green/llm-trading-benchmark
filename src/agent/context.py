@@ -20,14 +20,15 @@ from .prompt_loader import PromptLoader
 class ContextBuilder(IContextBuilder):
     """Builds LLM prompt messages from portfolio state and market data."""
 
-    def __init__(self, prompt_dir: str | None = None):
+    def __init__(self, prompt_dir: str | None = None, max_rounds: int = 4):
         self._loader = PromptLoader(prompt_dir)
+        self._max_rounds = max_rounds
 
     def build(
         self, timestamp: str, snapshot: PortfolioSnapshot,
         market_data: str, stock_data: str, alerts: str,
         news: str, round_num: int, tool_results: str,
-        trade_feedback: str = "",
+        trade_feedback: str = "", buy_quota_remaining: int = -1,
     ) -> list[dict[str, str]]:
         """Build messages with cache-friendly ordering.
 
@@ -46,11 +47,10 @@ class ContextBuilder(IContextBuilder):
 
         # --- Stable prefix (cacheable across decisions) ---
 
-        # Market rules + trading costs (most stable — almost never changes)
+        # Layer 1: Market Rules + Universe (never change during backtest → API cache hit)
         user_blocks.append(self._build_market_rules())
         user_blocks.append("")
 
-        # Layer 1: Universe (never changes during backtest)
         if market_data.strip():
             user_blocks.append(market_data)
             user_blocks.append("")
@@ -73,7 +73,7 @@ class ContextBuilder(IContextBuilder):
         # --- Volatile suffix (changes per round/decision) ---
 
         # Portfolio (changes after trades)
-        user_blocks.append(self._format_portfolio(snapshot))
+        user_blocks.append(self._format_portfolio(snapshot, buy_quota_remaining))
         user_blocks.append("")
 
         # Trade feedback from previous attempt (retry mode)
@@ -97,15 +97,16 @@ class ContextBuilder(IContextBuilder):
             user_blocks.append("")
 
         # Timestamp + Round + Instruction (most volatile, always last)
+        max_r = self._max_rounds
         user_blocks.append(f"[TIMESTAMP] {timestamp}")
-        user_blocks.append(f"[ROUND] {round_num}/8")
+        user_blocks.append(f"[ROUND] {round_num}/{max_r}")
 
         # Instruction
-        if round_num >= 8:
+        if round_num >= max_r:
             template = self._loader.load_final_round_instruction()
         else:
             template = self._loader.load_instruction_template()
-        instruction = template.replace("{round_num}", str(round_num)).replace("{max_rounds}", "8")
+        instruction = template.replace("{round_num}", str(round_num)).replace("{max_rounds}", str(max_r))
         user_blocks.append(instruction)
 
         user_content = "\n".join(user_blocks)
@@ -144,16 +145,16 @@ class ContextBuilder(IContextBuilder):
         # Layer 2: Candidate table
         table_lines = ["[CANDIDATES] Top screened stocks (ranked by composite score). You may also trade any stock in [UNIVERSE] — use query_stock for details:"]
         table_lines.append(
-            "rank|ticker|mkt|score|price|1h_chg|1d_chg|5d_chg|vol_rank|atr|rsi|trend|tradable"
+            "rank|ticker|mkt|score|price|1h_chg|1d_chg|5d_chg|rsi|trend|recent_6bars"
         )
 
         for i, c in enumerate(candidates):
             held_mark = " *" if c.sector == "HELD" else ""
+            recent = c.recent_bars if c.recent_bars else "N/A"
             table_lines.append(
                 f"{i+1:2d}|{c.ticker}{held_mark}|{c.market.value}|{c.composite:.2f}|"
                 f"{c.price:.2f}|{c.chg_1h:+.2f}|{c.chg_1d:+.2f}|{c.chg_5d:+.2f}|"
-                f"{c.volume_rank:.2f}|{c.atr:.2f}|{c.rsi:.0f}|{c.trend}|"
-                f"{'Y' if c.tradable else 'N'}"
+                f"{c.rsi:.0f}|{c.trend}|{recent}"
             )
 
         # Detail layer is deprecated — Candidate table already contains all metrics.
@@ -208,7 +209,9 @@ class ContextBuilder(IContextBuilder):
                 lines.append(f"  FAILED: {side} {qty} {sym}({mkt}) — {msg}")
 
         if has_failures:
-            lines.append("Failed trades will be retried. Adjust your orders based on the reasons above.")
+            lines.append("")
+            lines.append("IMPORTANT: The FAILED trades above CANNOT be executed as-is. Do NOT resubmit them unchanged.")
+            lines.append("Either: (a) fix the issue (reduce quantity, wait for market open, etc.), or (b) drop the trade entirely.")
         return "\n".join(lines)
 
     @staticmethod
@@ -385,7 +388,7 @@ Avoid trades where expected edge < transaction costs."""
 
         return "\n".join(lines)
 
-    def _format_portfolio(self, snap: PortfolioSnapshot) -> str:
+    def _format_portfolio(self, snap: PortfolioSnapshot, buy_quota_remaining: int = -1) -> str:
         lines = ["[PORTFOLIO]"]
         nav = snap.total_nav
         cash = snap.cash
@@ -395,15 +398,22 @@ Avoid trades where expected edge < transaction costs."""
         lines.append(f"NAV: ${nav:,.2f}")
         lines.append(f"Cash: ${cash:,.2f} ({cash_pct:.1f}% of NAV)")
         lines.append(f"Available for new positions: ${available:,.2f}")
+        if buy_quota_remaining >= 0:
+            lines.append(f"BUY quota remaining today: {buy_quota_remaining}")
 
         if snap.positions:
             lines.append("")
             lines.append("Positions:")
             frozen_positions = []
             for key, pos in snap.positions.items():
-                pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost > 0 else 0
                 pos_value = pos.market_value
                 pos_pct = pos_value / nav * 100 if nav > 0 else 0
+                # Skip ghost/residual positions (quantity <= 0 or allocation < 0.5% NAV)
+                if pos.quantity <= 0:
+                    continue
+                if pos_pct < 0.5:
+                    continue  # too small to meaningfully trade — ignore
+                pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost > 0 else 0
                 lines.append(
                     f"  {pos.symbol}({pos.market.value}): {pos.quantity}sh "
                     f"@ ${pos.avg_cost:.2f} -> ${pos.current_price:.2f} "

@@ -20,6 +20,9 @@ class Config:
     # --- Data paths ---
     stock_data_dir: str = "D:/Projects/claw/getStockData/data"
 
+    # --- Active model ---
+    model_name: str = "deepseek-v4-pro"
+
     # --- Database paths ---
     @property
     def db_paths(self) -> dict[Market, str]:
@@ -65,7 +68,7 @@ class Config:
     dataset_version: str = "2026-06-05"
 
     # --- Agent ---
-    max_agent_rounds: int = 8  # Round1=context, 2-7=tools, 8=mandatory decision
+    max_agent_rounds: int = 4  # Round1=context, 2-3=tools, 4=mandatory decision
     max_decisions: int = 0     # 0 = unlimited
 
     # --- Portfolio ---
@@ -176,6 +179,8 @@ class Config:
         kwargs = {
             # Data
             "stock_data_dir": os.path.join(base_dir, "data").replace("\\", "/"),
+            # Active model
+            "model_name": model_name,
             # Backtest
             "backtest_start": backtest_cfg.get("start", "2026-02-03"),
             "backtest_end": backtest_cfg.get("end", "2026-02-09"),
@@ -208,7 +213,7 @@ class Config:
                 Market.CRYPTO: costs_cfg.get("slippage_bps", {}).get("CRYPTO", 10),
             },
             # Agent
-            "max_agent_rounds": agent_cfg.get("max_rounds", 8),
+            "max_agent_rounds": agent_cfg.get("max_rounds", 4),
         }
 
         # Load all API keys (both models)

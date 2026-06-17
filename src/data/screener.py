@@ -48,6 +48,7 @@ class CandidateScore:
     market_activity: float
     recency: float
     composite: float
+    recent_bars: str = ""  # last 6 bars' 10-min % changes, e.g. "+0.1 -0.2 +0.3 ..."
 
 
 class Screener:
@@ -63,8 +64,8 @@ class Screener:
         timestamp: str,
         held_tickers: dict[str, Market] | None = None,
         quotas: dict[Market, int] | None = None,
-        competition_slots: int = 25,
-        total_target: int = 65,
+        competition_slots: int = 12,
+        total_target: int = 30,
     ) -> list[CandidateScore]:
         """Screen all stocks and return ranked candidates.
 
@@ -77,7 +78,7 @@ class Screener:
             total_target: total candidates to return
         """
         if quotas is None:
-            quotas = {Market.US: 15, Market.HK: 12, Market.CN: 10, Market.CRYPTO: 3}
+            quotas = {Market.US: 8, Market.HK: 5, Market.CN: 5, Market.CRYPTO: 2}
         if held_tickers is None:
             held_tickers = {}
 
@@ -132,6 +133,9 @@ class Screener:
         # Recency: check for recent breakout or volume spike
         recency = self._compute_recency(bars, timestamp)
 
+        # Recent 6-bar trajectory (10-min % changes)
+        recent_bars = self._compute_recent_bars(bars, timestamp, n=6)
+
         return CandidateScore(
             ticker=symbol,
             market=market,
@@ -155,6 +159,7 @@ class Screener:
             market_activity=0.0,
             recency=recency,
             composite=0.0,
+            recent_bars=recent_bars,
         )
 
     def _compute_percentile_ranks(self, scores: list[CandidateScore]) -> None:
@@ -216,14 +221,20 @@ class Screener:
         # 8. Random (0.10): added later in _random_explore
         # Not included in deterministic composite
 
+        # 9. Cost efficiency (0.03 weight): nudge cheaper markets up
+        # US=8bps CN=13bps HK=20bps Crypto=20bps round-trip per side
+        cost_map = {"US": 1.0, "CN": 0.6, "HK": 0.2, "CRYPTO": 0.5}
+        cost_efficiency = cost_map.get(s.market.value, 0.5)
+
         composite = (
-            0.20 * liquidity
-            + 0.15 * momentum
-            + 0.15 * volatility
+            0.19 * liquidity
+            + 0.14 * momentum
+            + 0.14 * volatility
             + 0.10 * reversal
             + 0.10 * trend_score
-            + 0.15 * market_activity
+            + 0.14 * market_activity
             + 0.05 * recency
+            + 0.03 * cost_efficiency
             # random 0.10 added during allocation
         )
 
@@ -332,6 +343,24 @@ class Screener:
         if len(relevant) < period:
             return 0.0
         return sum(b.volume for b in relevant[-period:]) / period
+
+    @staticmethod
+    def _compute_recent_bars(bars: list[OHLCVBar], timestamp: str, n: int = 6) -> str:
+        """Compute last N bars' 10-min % changes as a compact string.
+        Returns e.g. "+0.1 -0.3 +0.2 +0.1 -0.1 +0.4"
+        """
+        relevant = [b for b in bars if b.timestamp <= timestamp]
+        if len(relevant) < n + 1:
+            return "N/A"
+        recent = relevant[-(n + 1):]
+        parts = []
+        for i in range(1, len(recent)):
+            if recent[i - 1].close > 0:
+                chg = (recent[i].close - recent[i - 1].close) / recent[i - 1].close * 100
+                parts.append(f"{chg:+.1f}")
+            else:
+                parts.append("0.0")
+        return " ".join(parts)
 
     def _compute_recency(self, bars: list[OHLCVBar], timestamp: str) -> float:
         """Compute recency score: recent breakout or volume spike.

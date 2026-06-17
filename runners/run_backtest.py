@@ -74,7 +74,7 @@ def main():
         config = Config(**{**config.__dict__, **overrides})
 
     # Determine model name
-    model_name = args.model or config.mimo_pro_model or config.deepseek_model
+    model_name = args.model or config.model_name
 
     # Run benchmark
     runner = ExperimentRunner(config, model=model_name, db_path=args.output)

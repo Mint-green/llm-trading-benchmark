@@ -12,7 +12,7 @@ import os
 # PATH CONFIG — 数据源路径
 # ============================================================
 
-STOCK_DATA_ROOT = "D:/Projects/claw/getStockData"
+STOCK_DATA_ROOT = os.environ.get("STOCK_DATA_ROOT", os.path.expanduser("~/Desktop/getStockData"))
 FOREX_DB_PATH = os.path.join(STOCK_DATA_ROOT, "data", "FOREX_stock.db")
 
 # ============================================================
