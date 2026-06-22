@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 # Prompt 文件路径
-_PROMPT_FILE = Path(__file__).parent.parent / "prompts" / "active" / "prompts.py"
+_PROMPT_FILE = Path(__file__).parent.parent.parent / "prompts" / "active" / "prompts.py"
 
 
 def _load_module(filepath: Path):

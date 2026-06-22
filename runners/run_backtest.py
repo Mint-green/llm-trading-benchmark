@@ -67,7 +67,7 @@ def main():
     if args.max_decisions is not None:
         overrides["max_decisions"] = args.max_decisions
     if args.thinking:
-        overrides["enable_thinking"] = True
+        overrides["thinking_enabled"] = True
 
     # Apply overrides
     if overrides:
