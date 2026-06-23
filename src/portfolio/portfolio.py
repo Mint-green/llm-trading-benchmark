@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 from src.core.types import (
     Market, OrderSide, Position, PortfolioSnapshot, TradeOrder, TradeResult,
+    PortfolioTarget,
 )
 from src.core.interfaces import IPortfolioEngine, IConstraintEngine, IExecutionEngine, ISettlementEngine, IMarketRuleEngine
 from src.core.config import Config
@@ -28,6 +29,13 @@ class FxLog:
     from_amount: float
     to_amount: float
     rate: float
+
+
+@dataclass
+class TargetConversionResult:
+    """Result of converting portfolio targets to trade orders."""
+    orders: list[TradeOrder]
+    skipped: list[dict]  # {"symbol": str, "reason": str}
 
 
 # Market -> local currency
@@ -309,3 +317,92 @@ class PortfolioEngine(IPortfolioEngine):
             if pos:
                 pos.current_price = price
                 pos.unrealized_pnl = (price - pos.avg_cost) * pos.quantity
+
+    def convert_targets_to_orders(
+        self,
+        targets: list[PortfolioTarget],
+        prices: dict[str, float],  # symbol -> price in local currency
+        markets: dict[str, Market],  # symbol -> market
+    ) -> TargetConversionResult:
+        """Convert portfolio targets (target_pct_nav) to trade orders.
+
+        For each target:
+        1. Compute current % NAV for existing position
+        2. Compute delta = target - current
+        3. Convert delta to quantity (BUY or SELL)
+        4. Return list of TradeOrders
+
+        Args:
+            targets: LLM's portfolio targets
+            prices: current prices in local currency
+            markets: symbol -> market mapping
+        """
+        nav = self.nav
+        if nav <= 0:
+            return TargetConversionResult(orders=[], skipped=[{"symbol": "*", "reason": "NAV is zero"}])
+
+        orders: list[TradeOrder] = []
+        skipped: list[dict] = []
+
+        # Sort by priority (higher priority first)
+        sorted_targets = sorted(targets, key=lambda t: t.priority, reverse=True)
+
+        for target in sorted_targets:
+            sym = target.symbol
+            market = markets.get(sym)
+            if market is None:
+                skipped.append({"symbol": sym, "reason": "unknown market"})
+                continue
+
+            price = prices.get(sym)
+            if price is None or price <= 0:
+                skipped.append({"symbol": sym, "reason": "price unavailable"})
+                continue
+
+            # Current position
+            key = f"{market.value}:{sym}"
+            pos = self._positions.get(key)
+            current_value_usd = pos.market_value if pos else 0.0
+            current_pct_nav = current_value_usd / nav if nav > 0 else 0.0
+
+            # Target value
+            target_value_usd = nav * target.target_pct_nav
+            delta_value_usd = target_value_usd - current_value_usd
+
+            # Convert to local currency
+            currency = MARKET_CURRENCY.get(market, "USD")
+            price_usd = self._to_usd(price, market)
+
+            if abs(delta_value_usd) < nav * 0.005:  # < 0.5% NAV, skip
+                skipped.append({"symbol": sym, "reason": "delta too small (< 0.5% NAV)"})
+                continue
+
+            if delta_value_usd > 0:
+                # BUY
+                quantity = int(delta_value_usd / price_usd) if price_usd > 0 else 0
+                if quantity > 0:
+                    orders.append(TradeOrder(
+                        symbol=sym,
+                        market=market,
+                        side=OrderSide.BUY,
+                        quantity=quantity,
+                        allocation_pct=target.target_pct_nav,
+                        reason=target.reason,
+                    ))
+            elif delta_value_usd < 0:
+                # SELL
+                if pos is None:
+                    skipped.append({"symbol": sym, "reason": "no position to sell"})
+                    continue
+                quantity = min(pos.quantity, int(abs(delta_value_usd) / price_usd)) if price_usd > 0 else 0
+                if quantity > 0:
+                    orders.append(TradeOrder(
+                        symbol=sym,
+                        market=market,
+                        side=OrderSide.SELL,
+                        quantity=quantity,
+                        allocation_pct=target.target_pct_nav,
+                        reason=target.reason,
+                    ))
+
+        return TargetConversionResult(orders=orders, skipped=skipped)

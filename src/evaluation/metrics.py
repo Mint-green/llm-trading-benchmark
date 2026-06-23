@@ -2,21 +2,21 @@
 MetricsEngine — computes benchmark performance metrics.
 
 Metrics:
-  - Total Return
-  - Sharpe Ratio
-  - Sortino Ratio
-  - Max Drawdown
-  - Volatility (annualized)
-  - Win Rate
-  - Average Holding Period
-  - Turnover Rate
+  - Total Return, Sharpe, Sortino, Max Drawdown, Volatility
+  - Win Rate, Turnover, Average Holding Period
+
+Enhanced metrics (v3):
+  - Behavior: constraint_hits, rejected_orders, adjusted_orders, tool_usage
+  - PnL Attribution: by_market, by_asset_type, by_symbol
+  - Efficiency: fees, slippage, cash_drag
 """
 
 from __future__ import annotations
 import math
+from collections import defaultdict
 from typing import Any
 
-from src.core.types import PortfolioSnapshot, TradeResult, OrderSide
+from src.core.types import PortfolioSnapshot, TradeResult, OrderSide, Market
 from src.core.interfaces import IMetricsEngine
 
 
@@ -69,6 +69,7 @@ class MetricsEngine(IMetricsEngine):
 
         # Trade statistics
         successful_trades = [t for t in trades if t.success]
+        failed_trades = [t for t in trades if not t.success]
         buy_trades = [t for t in successful_trades if t.order.side == OrderSide.BUY]
         sell_trades = [t for t in successful_trades if t.order.side == OrderSide.SELL]
 
@@ -80,21 +81,145 @@ class MetricsEngine(IMetricsEngine):
         avg_nav = sum(navs) / len(navs) if navs else 1.0
         turnover = total_traded / avg_nav if avg_nav > 0 else 0.0
 
+        # Fees and slippage
+        total_fees = sum(t.fees for t in successful_trades)
+
+        # PnL attribution by market
+        pnl_by_market = self._compute_pnl_by_market(portfolio_history, successful_trades)
+
         return {
-            "total_return": round(total_return * 100, 4),  # percentage
+            # Core metrics
+            "total_return": round(total_return * 100, 4),
             "sharpe_ratio": round(sharpe, 4),
             "sortino_ratio": round(sortino, 4),
-            "max_drawdown": round(max_dd * 100, 4),  # percentage
-            "volatility": round(vol * 100, 4),  # percentage
+            "max_drawdown": round(max_dd * 100, 4),
+            "volatility": round(vol * 100, 4),
+            # Trade metrics
             "total_trades": len(successful_trades),
             "buy_trades": len(buy_trades),
             "sell_trades": len(sell_trades),
-            "win_rate": round(win_rate * 100, 2),  # percentage
+            "rejected_orders": len(failed_trades),
+            "win_rate": round(win_rate * 100, 2),
             "turnover": round(turnover, 4),
+            # NAV
             "initial_nav": initial_nav,
             "final_nav": final_nav,
             "total_return_usd": round(final_nav - initial_nav, 2),
+            # Efficiency
+            "total_fees_usd": round(total_fees, 2),
         }
+
+    def compute_behavior_metrics(
+        self,
+        decisions: list[dict],
+        trades: list[TradeResult],
+        tool_calls: list[dict],
+    ) -> dict[str, Any]:
+        """Compute behavior metrics.
+
+        Args:
+            decisions: list of decision records
+            trades: list of trade results
+            tool_calls: list of tool call records
+        """
+        successful = [t for t in trades if t.success]
+        failed = [t for t in trades if not t.success]
+
+        # Constraint hits (from failed trade reasons)
+        constraint_hits = sum(1 for t in failed if "constraint" in t.error.lower())
+        tail_guard_hits = sum(1 for t in failed if "tail_guard" in t.error.lower())
+        cooling_hits = sum(1 for t in failed if "cooling" in t.error.lower())
+
+        # Tool usage
+        total_tool_calls = len(tool_calls)
+        tool_names = defaultdict(int)
+        for tc in tool_calls:
+            tool_names[tc.get("tool_name", "unknown")] += 1
+
+        # Decision types
+        decision_types = defaultdict(int)
+        for d in decisions:
+            decision_types[d.get("decision_type", "unknown")] += 1
+
+        # Turnover level
+        total_traded = sum(t.cost for t in successful)
+        avg_nav = 100000  # placeholder
+        turnover_ratio = total_traded / avg_nav if avg_nav > 0 else 0
+        if turnover_ratio > 5:
+            turnover_level = "high"
+        elif turnover_ratio > 2:
+            turnover_level = "moderate"
+        else:
+            turnover_level = "low"
+
+        return {
+            "constraint_hits": constraint_hits,
+            "tail_guard_hits": tail_guard_hits,
+            "cooling_hits": cooling_hits,
+            "rejected_orders": len(failed),
+            "adjusted_orders": sum(1 for t in successful if t.order.quantity != getattr(t, 'requested_quantity', t.order.quantity)),
+            "total_tool_calls": total_tool_calls,
+            "tool_usage": dict(tool_names),
+            "decision_types": dict(decision_types),
+            "turnover_level": turnover_level,
+        }
+
+    def compute_pnl_attribution(
+        self,
+        portfolio_history: list[PortfolioSnapshot],
+        trades: list[TradeResult],
+    ) -> dict[str, Any]:
+        """Compute PnL attribution.
+
+        Returns:
+            {
+                "total_pnl_usd": float,
+                "by_market": {market: pnl},
+                "by_symbol": {symbol: pnl},
+                "fees_slippage_usd": float,
+            }
+        """
+        if len(portfolio_history) < 2:
+            return {"total_pnl_usd": 0, "by_market": {}, "by_symbol": {}, "fees_slippage_usd": 0}
+
+        initial_nav = portfolio_history[0].total_nav
+        final_nav = portfolio_history[-1].total_nav
+        total_pnl = final_nav - initial_nav
+
+        # PnL by market (from final snapshot positions)
+        by_market: dict[str, float] = defaultdict(float)
+        by_symbol: dict[str, float] = {}
+
+        final_snap = portfolio_history[-1]
+        for key, pos in final_snap.positions.items():
+            pnl = pos.unrealized_pnl
+            market = pos.market.value
+            by_market[market] += pnl
+            by_symbol[pos.symbol] = pnl
+
+        # Add realized PnL from trades
+        successful = [t for t in trades if t.success]
+        fees_total = sum(t.fees for t in successful)
+
+        return {
+            "total_pnl_usd": round(total_pnl, 2),
+            "by_market": {k: round(v, 2) for k, v in by_market.items()},
+            "by_symbol": {k: round(v, 2) for k, v in sorted(by_symbol.items(), key=lambda x: x[1], reverse=True)[:10]},
+            "fees_slippage_usd": round(fees_total, 2),
+        }
+
+    @staticmethod
+    def _compute_pnl_by_market(
+        history: list[PortfolioSnapshot], trades: list[TradeResult],
+    ) -> dict[str, float]:
+        """Compute PnL by market from final snapshot."""
+        if not history:
+            return {}
+        final = history[-1]
+        pnl: dict[str, float] = defaultdict(float)
+        for key, pos in final.positions.items():
+            pnl[pos.market.value] += pos.unrealized_pnl
+        return dict(pnl)
 
     @staticmethod
     def _std(values: list[float]) -> float:

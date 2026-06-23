@@ -65,16 +65,22 @@ class ExperimentLogger(IExperimentLogger):
 
     def _create_tables(self) -> None:
         self._conn.executescript("""
+            -- Core tables (existing)
             CREATE TABLE IF NOT EXISTS benchmark_runs (
                 run_id TEXT PRIMARY KEY,
                 model TEXT,
+                model_id TEXT,
+                model_version TEXT,
+                benchmark_id TEXT,
+                dataset_version TEXT,
+                prompt_version TEXT,
+                tool_version TEXT,
                 start_date TEXT,
                 end_date TEXT,
                 interval_min INTEGER,
                 initial_cash REAL,
                 thinking_enabled BOOLEAN,
                 config TEXT,
-                dataset_version TEXT,
                 status TEXT DEFAULT 'running',
                 created_at TEXT,
                 completed_at TEXT,
@@ -89,6 +95,7 @@ class ExperimentLogger(IExperimentLogger):
                 finished_at TEXT,
                 result TEXT
             );
+
             CREATE TABLE IF NOT EXISTS llm_calls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT,
@@ -103,16 +110,19 @@ class ExperimentLogger(IExperimentLogger):
                 response TEXT,
                 FOREIGN KEY (run_id) REFERENCES benchmark_runs(run_id)
             );
+
             CREATE TABLE IF NOT EXISTS decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT,
                 timestamp TEXT,
+                decision_type TEXT DEFAULT 'full_decision',
                 action TEXT,
                 trades TEXT,
                 reason TEXT,
                 portfolio_nav REAL,
                 FOREIGN KEY (run_id) REFERENCES benchmark_runs(run_id)
             );
+
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT,
@@ -128,6 +138,7 @@ class ExperimentLogger(IExperimentLogger):
                 error TEXT,
                 FOREIGN KEY (run_id) REFERENCES benchmark_runs(run_id)
             );
+
             CREATE TABLE IF NOT EXISTS portfolio_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT,
@@ -138,6 +149,7 @@ class ExperimentLogger(IExperimentLogger):
                 market_exposure TEXT,
                 FOREIGN KEY (run_id) REFERENCES benchmark_runs(run_id)
             );
+
             CREATE TABLE IF NOT EXISTS agent_rounds (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT,
@@ -148,6 +160,172 @@ class ExperimentLogger(IExperimentLogger):
                 tool_results TEXT,
                 latency_ms REAL,
                 FOREIGN KEY (run_id) REFERENCES benchmark_runs(run_id)
+            );
+
+            -- v3 tables: Decision events (enhanced decisions)
+            CREATE TABLE IF NOT EXISTS decision_events (
+                event_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                model_id TEXT,
+                decision_timestamp TEXT NOT NULL,
+                decision_type TEXT NOT NULL,
+                prompt_hash TEXT,
+                prompt_snapshot TEXT,
+                tool_schema_hash TEXT,
+                raw_model_output TEXT,
+                parsed_output TEXT,
+                validation_result TEXT,
+                execution_result TEXT,
+                state_diff TEXT,
+                token_usage TEXT,
+                latency_ms INTEGER,
+                created_at TEXT NOT NULL
+            );
+
+            -- v3 tables: Tool calls
+            CREATE TABLE IF NOT EXISTS tool_calls (
+                tool_call_id TEXT PRIMARY KEY,
+                event_id TEXT,
+                run_id TEXT NOT NULL,
+                decision_timestamp TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_args TEXT NOT NULL,
+                tool_result TEXT NOT NULL,
+                result_hash TEXT,
+                latency_ms INTEGER,
+                created_at TEXT NOT NULL
+            );
+
+            -- v3 tables: Active plans
+            CREATE TABLE IF NOT EXISTS active_plans (
+                plan_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                model_id TEXT,
+                symbol TEXT NOT NULL,
+                position_id TEXT,
+                status TEXT NOT NULL,
+                side TEXT,
+                entry_time TEXT,
+                entry_price REAL,
+                current_pct_nav REAL,
+                entry_reason TEXT,
+                plan_version INTEGER NOT NULL,
+                last_review_time TEXT,
+                last_review_price REAL,
+                atr_at_review REAL,
+                peak_since_entry REAL,
+                peak_since_last_review REAL,
+                intended_horizon_bars INTEGER,
+                plan_note TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            -- v3 tables: Plan versions
+            CREATE TABLE IF NOT EXISTS plan_versions (
+                plan_version_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                source_event_id TEXT,
+                plan_snapshot TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            -- v3 tables: Plan triggers
+            CREATE TABLE IF NOT EXISTS plan_triggers (
+                trigger_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                trigger_type TEXT NOT NULL,
+                trigger_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                triggered_at TEXT,
+                archived_at TEXT
+            );
+
+            -- v3 tables: Watchlist items
+            CREATE TABLE IF NOT EXISTS watchlist_items (
+                watch_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                model_id TEXT,
+                symbol TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT,
+                desired_condition_json TEXT,
+                source_event_id TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                archived_at TEXT
+            );
+
+            -- v3 tables: Avoid items
+            CREATE TABLE IF NOT EXISTS avoid_items (
+                avoid_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                model_id TEXT,
+                symbol TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT,
+                source_event_id TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                archived_at TEXT
+            );
+
+            -- v3 tables: Daily thesis versions
+            CREATE TABLE IF NOT EXISTS daily_thesis_versions (
+                thesis_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                model_id TEXT,
+                benchmark_day TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                confidence REAL,
+                source_event_id TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT
+            );
+
+            -- v3 tables: Summaries
+            CREATE TABLE IF NOT EXISTS summaries (
+                summary_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                model_id TEXT,
+                summary_type TEXT NOT NULL,
+                market TEXT,
+                benchmark_day TEXT,
+                source_start TEXT NOT NULL,
+                source_end TEXT NOT NULL,
+                summary_json TEXT NOT NULL,
+                summarizer_model TEXT,
+                prompt_hash TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            -- v3 tables: Metrics daily
+            CREATE TABLE IF NOT EXISTS metrics_daily (
+                metrics_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                benchmark_day TEXT NOT NULL,
+                nav_start_usd REAL,
+                nav_end_usd REAL,
+                daily_return_pct REAL,
+                max_drawdown_pct REAL,
+                turnover_pct REAL,
+                fees_usd REAL,
+                slippage_usd REAL,
+                rejected_orders INTEGER,
+                adjusted_orders INTEGER,
+                constraint_hits INTEGER,
+                tool_calls INTEGER,
+                pnl_by_market TEXT,
+                pnl_by_asset_type TEXT,
+                pnl_by_symbol TEXT,
+                attribution_json TEXT,
+                created_at TEXT NOT NULL
             );
         """)
 
@@ -191,13 +369,49 @@ class ExperimentLogger(IExperimentLogger):
         )
         self._conn.commit()
 
-    def log_round(self, round_data: AgentRound) -> None:
+    def log_round(self, round_data: AgentRound, timestamp: str = "") -> None:
+        """Log an agent round (v3: includes timestamp)."""
         self._conn.execute(
             "INSERT INTO agent_rounds (run_id, decision_timestamp, round_num, action, llm_response, tool_results, latency_ms) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (self._run_id, "", round_data.round_num,
+            (self._run_id, timestamp, round_data.round_num,
              round_data.decision.action, round_data.llm_response,
              round_data.tool_results, round_data.latency_ms),
+        )
+        self._conn.commit()
+
+    def log_tool_call(
+        self, timestamp: str, tool_name: str, tool_args: dict,
+        tool_result: str, latency_ms: float = 0,
+    ) -> None:
+        """Log a tool call (v3)."""
+        tool_call_id = f"tc_{self._run_id}_{timestamp}_{tool_name}_{id(tool_args)}"
+        args_json = json.dumps(tool_args)
+        result_hash = str(hash(tool_result))
+        self._conn.execute(
+            "INSERT INTO tool_calls (tool_call_id, run_id, decision_timestamp, tool_name, tool_args, tool_result, result_hash, latency_ms, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (tool_call_id, self._run_id, timestamp, tool_name, args_json,
+             tool_result, result_hash, latency_ms, datetime.now().isoformat()),
+        )
+        self._conn.commit()
+
+    def log_decision_event(
+        self, timestamp: str, decision_type: str,
+        prompt_snapshot: str = "", raw_output: str = "",
+        parsed_output: str = "", execution_result: str = "",
+        token_usage: str = "", latency_ms: int = 0,
+    ) -> None:
+        """Log a decision event (v3)."""
+        event_id = f"evt_{self._run_id}_{timestamp}_{id(raw_output)}"
+        self._conn.execute(
+            "INSERT INTO decision_events (event_id, run_id, decision_timestamp, decision_type, "
+            "prompt_snapshot, raw_model_output, parsed_output, execution_result, "
+            "token_usage, latency_ms, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (event_id, self._run_id, timestamp, decision_type,
+             prompt_snapshot, raw_output, parsed_output, execution_result,
+             token_usage, latency_ms, datetime.now().isoformat()),
         )
         self._conn.commit()
 

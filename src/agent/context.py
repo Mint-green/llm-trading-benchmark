@@ -1,17 +1,23 @@
 """
 ContextBuilder — assembles LLM prompt context.
 
-3-layer structure:
-  Layer 1 [UNIVERSE]:     Full list of investable tickers (names only)
-  Layer 2 [CANDIDATES]:   Screened 60-70 candidates with scores and key metrics
-  Layer 3 [STOCK_DATA]:   Top 10 detailed Compact Cards
+4-layer structure (v3):
+  Layer 1 [MARKET_RULES]:  Market rules and trading costs (stable, cacheable)
+  Layer 2 [UNIVERSE]:      Universe summary + candidate buckets
+  Layer 3 [OPEN MARKETS]:  Current market open/closed status
+  Layer 4 [PORTFOLIO]:     Current portfolio state + memory
 
 Prompts are loaded from prompts/active/prompts.py via PromptLoader.
 """
 
 from __future__ import annotations
 
-from src.core.types import PortfolioSnapshot, IndicatorSnapshot, Market
+from src.core.types import (
+    PortfolioSnapshot, IndicatorSnapshot, Market,
+    CandidateBuckets, CandidateInBucket, CandidateBucket,
+    MemoryState, DecisionType, RiskMode,
+    ActivePlan,
+)
 from src.core.interfaces import IContextBuilder
 from src.data.screener import CandidateScore
 from .prompt_loader import PromptLoader
@@ -33,29 +39,32 @@ class ContextBuilder(IContextBuilder):
         """Build messages with cache-friendly ordering.
 
         Order (most stable → most volatile):
-          1. UNIVERSE        — never changes
-          2. OPEN MARKETS    — changes by time of day
-          3. MARKET_SUMMARY  — rolling, every decision
-          4. CANDIDATES      — rolling, every decision
-          5. PORTFOLIO       — changes after trades
-          6. TRADE_FEEDBACK  — from previous attempt (retry mode)
-          7. TOOL_RESULTS    — changes per round
-          8. NEWS            — changes per decision
-          9. TIMESTAMP/ROUND/INSTRUCTION — changes per round
+          1. MARKET_RULES    — never changes
+          2. UNIVERSE        — never changes
+          3. OPEN MARKETS    — changes by time of day
+          4. MARKET_SUMMARY  — rolling, every decision
+          5. CANDIDATES      — rolling, every decision
+          6. PORTFOLIO       — changes after trades
+          7. MEMORY_STATE    — changes per decision
+          8. TRADE_FEEDBACK  — from previous attempt (retry mode)
+          9. TOOL_RESULTS    — changes per round
+          10. NEWS           — changes per decision
+          11. TIMESTAMP/ROUND/INSTRUCTION — changes per round
         """
         user_blocks = []
 
         # --- Stable prefix (cacheable across decisions) ---
 
-        # Layer 1: Market Rules + Universe (never change during backtest → API cache hit)
+        # Layer 1: Market Rules (never change during backtest → API cache hit)
         user_blocks.append(self._build_market_rules())
         user_blocks.append("")
 
+        # Layer 2: Universe summary (stable)
         if market_data.strip():
             user_blocks.append(market_data)
             user_blocks.append("")
 
-        # Open markets (changes by time of day, stable within same hour)
+        # Layer 3: Open markets (changes by time of day)
         open_markets = self._get_open_markets(timestamp)
         user_blocks.append(f"[OPEN MARKETS] {open_markets}")
         user_blocks.append("")
@@ -65,7 +74,7 @@ class ContextBuilder(IContextBuilder):
         user_blocks.append(fx_info)
         user_blocks.append("")
 
-        # Layer 2: Market Summary + Candidates (rolling, changes every decision)
+        # Layer 4: Market Summary + Candidates (rolling, changes every decision)
         if stock_data.strip():
             user_blocks.append(stock_data)
             user_blocks.append("")
@@ -108,6 +117,210 @@ class ContextBuilder(IContextBuilder):
             template = self._loader.load_instruction_template()
         instruction = template.replace("{round_num}", str(round_num)).replace("{max_rounds}", str(max_r))
         user_blocks.append(instruction)
+
+        user_content = "\n".join(user_blocks)
+        system_prompt = self._loader.load_system_prompt()
+
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+    def build_full_decision(
+        self,
+        timestamp: str,
+        snapshot: PortfolioSnapshot,
+        market_summary: str,
+        buckets: CandidateBuckets,
+        memory_state: MemoryState,
+        risk_mode: RiskMode,
+        open_markets: list[str],
+        closed_markets: list[str],
+        benchmark_day: int,
+        bar_index: int,
+        round_num: int,
+        tool_results: str = "",
+    ) -> list[dict[str, str]]:
+        """Build full decision prompt (v3 style).
+
+        4-layer structure with bucketed candidates and memory state.
+        """
+        user_blocks = []
+
+        # --- Layer 1: MARKET_RULES (stable) ---
+        user_blocks.append(self._build_market_rules())
+        user_blocks.append("")
+
+        # --- Layer 2: MARKET_SUMMARY ---
+        if market_summary.strip():
+            user_blocks.append(market_summary)
+            user_blocks.append("")
+
+        # --- Layer 3: OPEN MARKETS ---
+        open_str = ", ".join(open_markets) if open_markets else "none"
+        closed_str = ", ".join(closed_markets) if closed_markets else "none"
+        user_blocks.append(f"[OPEN MARKETS] OPEN: {open_str} | CLOSED: {closed_str}")
+        user_blocks.append("")
+
+        # --- Layer 4: PORTFOLIO ---
+        user_blocks.append(self._format_portfolio_v2(snapshot, risk_mode))
+        user_blocks.append("")
+
+        # --- MEMORY_STATE ---
+        user_blocks.append(self._format_memory_state(memory_state))
+        user_blocks.append("")
+
+        # --- CANDIDATE_BUCKETS ---
+        user_blocks.append(self._format_candidate_buckets(buckets))
+        user_blocks.append("")
+
+        # --- DECISION_CONTEXT ---
+        user_blocks.append(self._format_decision_context(
+            timestamp, "full_decision", open_markets, closed_markets,
+            benchmark_day, bar_index,
+        ))
+        user_blocks.append("")
+
+        # --- Tool results ---
+        if tool_results:
+            user_blocks.append(tool_results)
+            user_blocks.append("")
+
+        # --- Round + Instruction ---
+        max_r = self._max_rounds
+        user_blocks.append(f"[ROUND] {round_num}/{max_r}")
+        if round_num >= max_r:
+            user_blocks.append(self._loader.load_final_round_instruction())
+        else:
+            instruction = self._loader.load_instruction_template()
+            instruction = instruction.replace("{round_num}", str(round_num)).replace("{max_rounds}", str(max_r))
+            user_blocks.append(instruction)
+
+        user_content = "\n".join(user_blocks)
+        system_prompt = self._loader.load_system_prompt()
+
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+    def build_focused_position_decision(
+        self,
+        timestamp: str,
+        snapshot: PortfolioSnapshot,
+        symbol: str,
+        plan: ActivePlan | None,
+        trigger_detail: dict,
+        priority: str,
+        round_num: int,
+        allowed_actions: str = "hold, reduce, close",
+        tool_results: str = "",
+    ) -> list[dict[str, str]]:
+        """Build focused position decision prompt."""
+        user_blocks = []
+
+        user_blocks.append("[OBJECTIVE]")
+        user_blocks.append("Handle one focused position event. Do not re-evaluate the whole market. Output JSON only.")
+        user_blocks.append("")
+
+        user_blocks.append(f"[DECISION_CONTEXT]")
+        user_blocks.append(f'decision_type: focused_position_decision')
+        user_blocks.append(f'timestamp_utc: {timestamp}')
+        user_blocks.append(f'scope: [{symbol}]')
+        user_blocks.append("")
+
+        user_blocks.append("[TRIGGER]")
+        user_blocks.append(f'symbol: {symbol}')
+        user_blocks.append(f'priority: {priority}')
+        user_blocks.append(f'detail: {trigger_detail}')
+        user_blocks.append("")
+
+        # Position info
+        pos = snapshot.positions.get(f"*:{symbol}") or self._find_position(snapshot, symbol)
+        if pos:
+            pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost > 0 else 0
+            pos_pct = pos.market_value / snapshot.total_nav * 100 if snapshot.total_nav > 0 else 0
+            user_blocks.append("[POSITION]")
+            user_blocks.append(f'{pos.symbol}|{pos.market.value}|{pos_pct:.1f}%|{pos.avg_cost:.2f}|{pos.current_price:.2f}|{pnl_pct:+.1f}%|sellable')
+            user_blocks.append("")
+
+        if plan:
+            user_blocks.append("[PREVIOUS_PLAN]")
+            user_blocks.append(f'entry_reason: {plan.entry_reason}')
+            user_blocks.append(f'last_review: {plan.last_review_time} @ {plan.last_review_price:.2f}')
+            user_blocks.append(f'horizon: {plan.intended_horizon_bars} bars')
+            user_blocks.append(f'note: {plan.plan_note}')
+            user_blocks.append("")
+
+        user_blocks.append(f"[ALLOWED_ACTIONS] {allowed_actions}")
+        user_blocks.append("")
+
+        if tool_results:
+            user_blocks.append(tool_results)
+            user_blocks.append("")
+
+        max_r = self._max_rounds
+        user_blocks.append(f"[ROUND] {round_num}/{max_r}")
+        if round_num >= max_r:
+            user_blocks.append(self._loader.load_final_round_instruction())
+
+        user_content = "\n".join(user_blocks)
+        system_prompt = self._loader.load_system_prompt()
+
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+    def build_focused_market_decision(
+        self,
+        timestamp: str,
+        snapshot: PortfolioSnapshot,
+        event_type: str,
+        event_detail: dict,
+        scope_market: str,
+        round_num: int,
+        allowed_actions: str = "hold, reduce, close",
+        tool_results: str = "",
+    ) -> list[dict[str, str]]:
+        """Build focused market/risk decision prompt."""
+        user_blocks = []
+
+        user_blocks.append("[OBJECTIVE]")
+        user_blocks.append("Handle a market/risk event. Do not do general stock picking unless explicitly allowed. Output JSON only.")
+        user_blocks.append("")
+
+        user_blocks.append("[DECISION_CONTEXT]")
+        user_blocks.append(f'decision_type: focused_market_or_risk_decision')
+        user_blocks.append(f'timestamp_utc: {timestamp}')
+        user_blocks.append(f'event_type: {event_type}')
+        user_blocks.append(f'scope_market: {scope_market}')
+        user_blocks.append("")
+
+        user_blocks.append("[EVENT]")
+        user_blocks.append(str(event_detail))
+        user_blocks.append("")
+
+        # Relevant positions
+        relevant = {k: v for k, v in snapshot.positions.items() if v.market.value == scope_market}
+        if relevant:
+            user_blocks.append("[RELEVANT_POSITIONS]")
+            for key, pos in relevant.items():
+                pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost > 0 else 0
+                user_blocks.append(f'{pos.symbol}|{pos.market.value}|{pos.quantity}sh|{pnl_pct:+.1f}%')
+            user_blocks.append("")
+
+        user_blocks.append(f"[ALLOWED_ACTIONS] {allowed_actions}")
+        user_blocks.append("")
+
+        if tool_results:
+            user_blocks.append(tool_results)
+            user_blocks.append("")
+
+        max_r = self._max_rounds
+        user_blocks.append(f"[ROUND] {round_num}/{max_r}")
+        if round_num >= max_r:
+            user_blocks.append(self._loader.load_final_round_instruction())
 
         user_content = "\n".join(user_blocks)
         system_prompt = self._loader.load_system_prompt()
@@ -310,15 +523,20 @@ Avoid trades where expected edge < transaction costs."""
         features,  # FeatureGenerator
         timestamp: str,
         index_returns: dict | None = None,
+        open_markets: list[Market] | None = None,
     ) -> str:
         """Build market summary from ALL stocks in each market (full universe).
 
-        Fields: Market|Index|Index1H|Index1D|UniverseAvg1H|UniverseAvg1D|
-                UpDown1H|UpDown1D|BullRatio|Volatility|Status
+        Fields: Market|Open|Regime|TradeAllowed|Universe1H|Universe1D|Breadth|Vol
 
         Args:
             index_returns: {Market: {"symbol": str, "return_1h": float, "return_1d": float}}
+            open_markets: list of open markets
         """
+        if open_markets is None:
+            open_markets = [Market.US, Market.HK, Market.CN, Market.CRYPTO]
+
+        open_market_set = set(open_markets)
         index_defaults = {
             Market.US: "NDX",
             Market.HK: "HSI",
@@ -327,13 +545,17 @@ Avoid trades where expected edge < transaction costs."""
         }
 
         lines = ["[MARKET_SUMMARY]"]
-        lines.append("Market|Index|Index1H|Index1D|UniverseAvg1H|UniverseAvg1D|UpDown1H|UpDown1D|BullRatio|Volatility|Status")
+        lines.append("Market|Open|Regime|TradeAllowed|Universe1H|Universe1D|Breadth|Vol")
 
         for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO]:
             market_bars = all_bars.get(market, {})
+            is_open = market in open_market_set
+            open_str = "yes" if is_open else "no"
+            trade_allowed = "yes" if is_open else "no"
+
             if not market_bars:
                 idx = index_defaults.get(market, "?")
-                lines.append(f"{market.value}|{idx}|N/A|N/A|N/A|N/A|N/A|N/A|N/A|N/A|CLOSED")
+                lines.append(f"{market.value}|{open_str}|N/A|{trade_allowed}|N/A|N/A|N/A|N/A")
                 continue
 
             # Compute indicators for ALL stocks in this market
@@ -353,37 +575,37 @@ Avoid trades where expected edge < transaction costs."""
 
             n = len(chg_1h_list)
             if n == 0:
-                idx = index_defaults.get(market, "?")
-                lines.append(f"{market.value}|{idx}|N/A|N/A|N/A|N/A|N/A|N/A|N/A|N/A|N/A")
+                lines.append(f"{market.value}|{open_str}|N/A|{trade_allowed}|N/A|N/A|N/A|N/A")
                 continue
 
             avg_1h = sum(chg_1h_list) / n
             avg_1d = sum(chg_1d_list) / n
             up_1h = sum(1 for v in chg_1h_list if v > 0)
             down_1h = n - up_1h
-            up_1d = sum(1 for v in chg_1d_list if v > 0)
-            down_1d = n - up_1d
             bull_count = sum(1 for v in rsi_list if v > 60)
             bull_ratio = bull_count / n
             avg_atr = sum(atr_list) / n
-            status = "OPEN"  # would use AssetStatusProvider
 
-            idx = index_defaults.get(market, "?")
-            # Get real index returns if available
-            idx_1h = "N/A"
-            idx_1d = "N/A"
-            if index_returns and market in index_returns:
-                r = index_returns[market]
-                if r.get("return_1h") is not None:
-                    idx_1h = f"{r['return_1h']:+.2f}"
-                if r.get("return_1d") is not None:
-                    idx_1d = f"{r['return_1d']:+.2f}"
+            # Compute regime: GREEN/YELLOW/RED based on breadth ratio and avg change
+            # Use up/(up+down) as breadth ratio, not bull_ratio (RSI > 60)
+            total = up_1h + (n - up_1h)
+            breadth_ratio = up_1h / total if total > 0 else 0.5
+
+            # Regime logic:
+            # GREEN: breadth > 55% AND avg_1h > 0%
+            # RED: breadth < 40% OR avg_1h < -0.5%
+            # YELLOW: everything else
+            if breadth_ratio > 0.55 and avg_1h > 0:
+                regime = "GREEN"
+            elif breadth_ratio < 0.40 or avg_1h < -0.5:
+                regime = "RED"
+            else:
+                regime = "YELLOW"
 
             lines.append(
-                f"{market.value}|{idx}|{idx_1h}|{idx_1d}|"
+                f"{market.value}|{open_str}|{regime}|{trade_allowed}|"
                 f"{avg_1h:+.2f}|{avg_1d:+.2f}|"
-                f"{up_1h}/{down_1h}|{up_1d}/{down_1d}|"
-                f"{bull_ratio:.2f}|{avg_atr:.3f}|{status}"
+                f"{up_1h}/{down_1h}|{avg_atr:.3f}"
             )
 
         return "\n".join(lines)
@@ -437,4 +659,210 @@ Avoid trades where expected edge < transaction costs."""
             )
             lines.append(f"Market exposure: {exposure_str}")
 
+        return "\n".join(lines)
+
+    @staticmethod
+    def _find_position(snapshot: PortfolioSnapshot, symbol: str):
+        """Find a position by symbol across all markets."""
+        for key, pos in snapshot.positions.items():
+            if pos.symbol == symbol:
+                return pos
+        return None
+
+    def _format_portfolio_v2(self, snap: PortfolioSnapshot, risk_mode: RiskMode) -> str:
+        """Format portfolio section (v3 style)."""
+        lines = ["[PORTFOLIO]"]
+        nav = snap.total_nav
+        cash = snap.cash
+        cash_pct = cash / nav * 100 if nav > 0 else 0
+
+        lines.append(f"NAV_USD={nav:,.2f}")
+        lines.append(f"cash_pct_nav={cash_pct:.1f}%")
+        lines.append(f"risk_mode={risk_mode.value}")
+        lines.append("")
+
+        if snap.positions:
+            lines.append("symbol|mkt|pct_nav|pnl_pct|hold_bars|trend|rsi|sellable|plan_status|risk_note")
+            for key, pos in snap.positions.items():
+                if pos.quantity <= 0:
+                    continue
+                pos_pct = pos.market_value / nav * 100 if nav > 0 else 0
+                if pos_pct < 0.5:
+                    continue
+                pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost > 0 else 0
+                frozen = key in snap.frozen_keys
+                sellable = "no" if frozen else "yes"
+                lines.append(
+                    f"{pos.symbol}|{pos.market.value}|{pos_pct:.1f}%|{pnl_pct:+.1f}%|"
+                    f"0|||{sellable}||"
+                )
+        else:
+            lines.append("No positions")
+
+        return "\n".join(lines)
+
+    def _format_memory_state(self, memory: MemoryState) -> str:
+        """Format memory state section."""
+        lines = ["[MEMORY_STATE]"]
+
+        # Previous daily summary
+        if memory.previous_daily_summary:
+            ds = memory.previous_daily_summary
+            lines.append(f"previous_daily_summary: {ds.market_read}")
+            if ds.major_decisions:
+                lines.append(f"  major_decisions: {', '.join(ds.major_decisions[:3])}")
+
+        # Daily thesis
+        if memory.daily_thesis:
+            lines.append(f"daily_thesis: {memory.daily_thesis.text} (conf={memory.daily_thesis.confidence:.2f})")
+
+        # Recent activity
+        ra = memory.recent_activity
+        if ra.non_hold_decisions:
+            lines.append(f"recent_decisions: {'; '.join(ra.non_hold_decisions)}")
+        if ra.execution_feedback:
+            lines.append(f"recent_feedback: {'; '.join(ra.execution_feedback)}")
+
+        # Watchlist (table format with status)
+        if memory.watchlist:
+            lines.append("watchlist:")
+            lines.append("symbol|condition|met|action_hint")
+            for w in memory.watchlist:
+                condition = w.reason or ""
+                # Simple met check: if condition mentions RSI, we'd need current RSI
+                # For now, mark as unknown if not computable
+                met = "unknown"
+                action_hint = "keep_watch"
+                lines.append(f"{w.symbol}|{condition}|{met}|{action_hint}")
+
+        # Avoid list
+        if memory.avoid_list:
+            lines.append("avoid_list:")
+            for a in memory.avoid_list:
+                lines.append(f"  {a.symbol}: {a.reason}")
+
+        # Behavior notes
+        if memory.rolling_behavior_notes:
+            lines.append(f"behavior_notes: {'; '.join(memory.rolling_behavior_notes)}")
+
+        return "\n".join(lines)
+
+    def _format_candidate_buckets(self, buckets: CandidateBuckets) -> str:
+        """Format candidate buckets section."""
+        lines = ["[CANDIDATE_BUCKETS]"]
+
+        # Helper to format a bucket
+        def fmt_bucket(name: str, items: list[CandidateInBucket], fields: str):
+            if not items:
+                return
+            lines.append(f"")
+            lines.append(f"# {name}")
+            lines.append(fields)
+            for c in items:
+                lines.append(self._format_candidate_line(c, name))
+
+        # held_positions
+        fmt_bucket("held_positions", buckets.held_positions,
+                   "symbol|mkt|price|pnl_pct|trend|rsi|risk_note|suggested_action")
+
+        # exit_watch
+        fmt_bucket("exit_watch", buckets.exit_watch,
+                   "symbol|mkt|price|pnl_pct|rsi|reason|action")
+
+        # trend_leaders (shortened)
+        fmt_bucket("trend_leaders", buckets.trend_leaders,
+                   "symbol|mkt|price|score|1d_pct|5d_pct|rsi|trend|cost|risk")
+
+        # pullback_continuation (shortened)
+        fmt_bucket("pullback_continuation", buckets.pullback_continuation,
+                   "symbol|mkt|price|score|1d_pct|5d_pct|rsi|trend|risk")
+
+        # oversold_reversal (shortened)
+        fmt_bucket("oversold_reversal", buckets.oversold_reversal,
+                   "symbol|mkt|price|score|1d_pct|5d_pct|rsi|trend|risk")
+
+        # low_vol_defensive (shortened)
+        fmt_bucket("low_vol_defensive", buckets.low_vol_defensive,
+                   "symbol|mkt|price|score|1d_pct|rsi|atr%|cost|risk")
+
+        # crypto_candidates (shortened)
+        fmt_bucket("crypto_candidates", buckets.crypto_candidates,
+                   "symbol|price|score|1d_pct|rsi|vol|risk")
+
+        # blocked_or_warning
+        fmt_bucket("blocked_or_warning", buckets.blocked_or_warning,
+                   "symbol|mkt|reason|action")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _risk_tag(c: CandidateInBucket, bucket_name: str) -> str:
+        """Generate short risk tag for a candidate."""
+        if c.risk_note and "closed" in c.risk_note.lower():
+            return "closed_market"
+        if c.risk_note and "reversal" in c.risk_note.lower():
+            return "high_reversal_risk"
+        if bucket_name == "crypto_candidates":
+            return "crypto_beta"
+        if c.rsi and c.rsi < 25:
+            return "deeply_oversold"
+        if c.rsi and c.rsi > 70:
+            return "overbought"
+        return ""
+
+    def _format_candidate_line(self, c: CandidateInBucket, bucket_name: str) -> str:
+        """Format a single candidate line based on bucket type (shortened format)."""
+        risk = self._risk_tag(c, bucket_name)
+
+        if bucket_name == "held_positions":
+            return (f"{c.ticker}|{c.market.value}|{c.price:.2f}|{c.pnl_pct:+.1f}%|"
+                    f"{c.trend}|{c.risk_note}|hold")
+
+        if bucket_name == "exit_watch":
+            return (f"{c.ticker}|{c.market.value}|{c.price:.2f}|{c.pnl_pct:+.1f}%|"
+                    f"||{c.reason}|{c.allowed_action}")
+
+        if bucket_name == "trend_leaders":
+            return (f"{c.ticker}|{c.market.value}|{c.price:.2f}|{c.score:.2f}|"
+                    f"{c.chg_1d:+.1f}|{c.chg_5d:+.1f}|{c.rsi:.0f}|{c.trend}|"
+                    f"{c.cost_bps:.0f}bps|{risk}")
+
+        if bucket_name == "pullback_continuation":
+            return (f"{c.ticker}|{c.market.value}|{c.price:.2f}|{c.score:.2f}|"
+                    f"{c.chg_1d:+.1f}|{c.chg_5d:+.1f}|{c.rsi:.0f}|{c.trend}|{risk}")
+
+        if bucket_name == "oversold_reversal":
+            return (f"{c.ticker}|{c.market.value}|{c.price:.2f}|{c.score:.2f}|"
+                    f"{c.chg_1d:+.1f}|{c.chg_5d:+.1f}|{c.rsi:.0f}|{c.trend}|{risk}")
+
+        if bucket_name == "low_vol_defensive":
+            return (f"{c.ticker}|{c.market.value}|{c.price:.2f}|{c.score:.2f}|"
+                    f"{c.chg_5d:+.1f}|{c.rsi:.0f}|{c.atr_pct:.2f}|"
+                    f"{c.cost_bps:.0f}bps|{risk}")
+
+        if bucket_name == "crypto_candidates":
+            return (f"{c.ticker}|{c.price:.2f}|{c.score:.2f}|"
+                    f"{c.chg_1d:+.1f}|{c.rsi:.0f}|{c.volatility:.2f}|{risk}")
+            return (f"{c.ticker}|{c.price:.2f}|{c.score:.2f}|"
+                    f"{c.chg_1h:+.2f}|{c.chg_1d:+.2f}|{c.chg_5d:+.2f}|"
+                    f"{c.rsi:.0f}|{c.volatility:.2f}|{c.liquidity:.2f}|{c.risk_note}")
+
+        if bucket_name == "blocked_or_warning":
+            return f"{c.ticker}|{c.market.value}|{c.reason}|{c.allowed_action}"
+
+        return ""
+
+    def _format_decision_context(
+        self, timestamp: str, decision_type: str,
+        open_markets: list[str], closed_markets: list[str],
+        benchmark_day: int, bar_index: int,
+    ) -> str:
+        """Format decision context section."""
+        lines = ["[DECISION_CONTEXT]"]
+        lines.append(f'decision_type: {decision_type}')
+        lines.append(f'timestamp_utc: {timestamp}')
+        lines.append(f'benchmark_day: {benchmark_day}')
+        lines.append(f'bar_index: {bar_index}')
+        lines.append(f'open_markets: {open_markets}')
+        lines.append(f'closed_markets: {closed_markets}')
         return "\n".join(lines)

@@ -1,15 +1,26 @@
 """
-Candidate Generation Layer — 8-factor composite scoring + market quota + random explore.
+Candidate Generation Layer — 8-factor composite scoring + 9-bucket classification.
 
 Scoring factors (designed for style coverage, not strategy injection):
-  0.20  Liquidity      — can you trade it (volume_rank, turnover_rank)
-  0.15  Momentum       — direction (mixed 1h/1d/5d returns)
-  0.15  Volatility     — trading opportunity space (ATR percentile)
+  0.19  Liquidity      — can you trade it (volume_rank, turnover_rank)
+  0.14  Momentum       — direction (mixed 1h/1d/5d returns)
+  0.14  Volatility     — trading opportunity space (ATR percentile)
   0.10  Reversal       — oversold bounce potential (RSI<35 + negative 5d)
   0.10  Trend          — trend state (UU/UD/DU/DD)
-  0.15  Market Activity — is something happening (rel_vol, abnormal_move, sector_heat)
+  0.14  Market Activity — is something happening (rel_vol, abnormal_move, sector_heat)
   0.05  Recency        — recent breakout/volume spike
   0.10  Random Explore — injected after deterministic ranking (5-10% replacement)
+  0.03  Cost Efficiency — nudge cheaper markets up
+
+Buckets:
+  held_positions       — current holdings (always shown)
+  exit_watch           — positions with weak signals
+  trend_leaders        — strong trend + volume
+  pullback_continuation — good trend, short-term pullback
+  oversold_reversal    — RI<35, potential bounce
+  low_vol_defensive    — low volatility, defensive
+  crypto_candidates    — crypto only
+  blocked_or_warning   — non-tradable, limit-locked
 """
 
 from __future__ import annotations
@@ -17,7 +28,10 @@ import random
 from dataclasses import dataclass
 from typing import Any
 
-from src.core.types import Market, IndicatorSnapshot, OHLCVBar
+from src.core.types import (
+    Market, IndicatorSnapshot, OHLCVBar,
+    CandidateBucket, CandidateInBucket, CandidateBuckets,
+)
 from src.core.interfaces import IFeatureGenerator
 from .sectors import get_sector
 
@@ -110,6 +124,308 @@ class Screener:
         selected.sort(key=lambda x: x.composite, reverse=True)
 
         return selected
+
+    # Bucket limits for prompt size control
+    BUCKET_LIMITS = {
+        "trend_leaders": 5,
+        "pullback_continuation": 5,
+        "oversold_reversal": 10,
+        "low_vol_defensive": 5,
+        "crypto_candidates": 8,
+        "blocked_or_warning": 5,
+    }
+
+    def screen_into_buckets(
+        self,
+        all_bars: dict[Market, dict[str, list[OHLCVBar]]],
+        timestamp: str,
+        held_positions: dict[str, dict] | None = None,
+        exit_watch_positions: dict[str, dict] | None = None,
+        open_markets: list[Market] | None = None,
+    ) -> CandidateBuckets:
+        """Screen all stocks and classify into 9 buckets.
+
+        Args:
+            all_bars: {market: {symbol: [bars]}}
+            timestamp: decision timestamp
+            held_positions: {symbol: {market, pnl_pct, pct_nav, hold_bars, sellable, plan_status}}
+            exit_watch_positions: {symbol: {market, pnl_pct, pct_nav, reason}}
+            open_markets: list of open markets (only these appear in new candidates)
+        """
+        if held_positions is None:
+            held_positions = {}
+        if exit_watch_positions is None:
+            exit_watch_positions = {}
+        if open_markets is None:
+            open_markets = [Market.US, Market.HK, Market.CN, Market.CRYPTO]
+
+        open_market_set = set(open_markets)
+
+        # Step 1: Score all stocks (only from open markets for new candidates)
+        all_scores: list[CandidateScore] = []
+        for market, market_bars in all_bars.items():
+            for symbol, bars in market_bars.items():
+                score = self._score_stock(market, symbol, bars, timestamp)
+                if score is not None:
+                    # Mark closed market stocks as not tradable for candidates
+                    if market not in open_market_set:
+                        score.tradable = False
+                    all_scores.append(score)
+
+        if not all_scores:
+            return CandidateBuckets(
+                held_positions=[], exit_watch=[], trend_leaders=[],
+                pullback_continuation=[], oversold_reversal=[],
+                low_vol_defensive=[], crypto_candidates=[], blocked_or_warning=[],
+            )
+
+        # Step 2: Compute percentile ranks and composite scores
+        self._compute_percentile_ranks(all_scores)
+        for s in all_scores:
+            s.composite = self._compute_composite(s)
+
+        # Step 3: Classify into buckets
+        buckets = self._classify_buckets(
+            all_scores, held_positions, exit_watch_positions,
+            open_market_set=open_market_set,
+        )
+
+        # Step 4: Apply bucket limits
+        buckets = self._apply_bucket_limits(buckets)
+
+        return buckets
+
+    def _apply_bucket_limits(self, buckets: CandidateBuckets) -> CandidateBuckets:
+        """Apply row limits to each bucket."""
+        return CandidateBuckets(
+            held_positions=buckets.held_positions,
+            exit_watch=buckets.exit_watch[:10],
+            trend_leaders=buckets.trend_leaders[:self.BUCKET_LIMITS["trend_leaders"]],
+            pullback_continuation=buckets.pullback_continuation[:self.BUCKET_LIMITS["pullback_continuation"]],
+            oversold_reversal=buckets.oversold_reversal[:self.BUCKET_LIMITS["oversold_reversal"]],
+            low_vol_defensive=buckets.low_vol_defensive[:self.BUCKET_LIMITS["low_vol_defensive"]],
+            crypto_candidates=buckets.crypto_candidates[:self.BUCKET_LIMITS["crypto_candidates"]],
+            blocked_or_warning=buckets.blocked_or_warning[:self.BUCKET_LIMITS["blocked_or_warning"]],
+        )
+
+    def _classify_buckets(
+        self,
+        all_scores: list[CandidateScore],
+        held_positions: dict[str, dict],
+        exit_watch_positions: dict[str, dict],
+        open_market_set: set[Market] | None = None,
+    ) -> CandidateBuckets:
+        """Classify scored stocks into 9 buckets.
+
+        Closed market stocks only appear in: held_positions, exit_watch, blocked_or_warning.
+        They do NOT appear in: trend_leaders, pullback_continuation, oversold_reversal, low_vol_defensive, crypto_candidates.
+        """
+        if open_market_set is None:
+            open_market_set = {Market.US, Market.HK, Market.CN, Market.CRYPTO}
+
+        # Sort by composite for trend_leaders
+        sorted_by_score = sorted(all_scores, key=lambda x: x.composite, reverse=True)
+
+        # Build held_positions bucket
+        held_bucket: list[CandidateInBucket] = []
+        held_tickers: set[str] = set()
+        for sym, info in held_positions.items():
+            held_tickers.add(sym)
+            held_bucket.append(CandidateInBucket(
+                bucket=CandidateBucket.HELD_POSITIONS,
+                ticker=sym,
+                market=info.get("market", Market.US),
+                price=info.get("price", 0.0),
+                score=info.get("score", 0.0),
+                pnl_pct=info.get("pnl_pct", 0.0),
+                pct_nav=info.get("pnl_pct", 0.0),
+                hold_bars=info.get("hold_bars", 0),
+                sellable=info.get("sellable", True),
+                plan_status=info.get("plan_status", ""),
+                risk_note=info.get("risk_note", ""),
+            ))
+
+        # Build exit_watch bucket
+        exit_bucket: list[CandidateInBucket] = []
+        exit_tickers: set[str] = set()
+        for sym, info in exit_watch_positions.items():
+            exit_tickers.add(sym)
+            exit_bucket.append(CandidateInBucket(
+                bucket=CandidateBucket.EXIT_WATCH,
+                ticker=sym,
+                market=info.get("market", Market.US),
+                price=info.get("price", 0.0),
+                score=info.get("score", 0.0),
+                pnl_pct=info.get("pnl_pct", 0.0),
+                pct_nav=info.get("pnl_pct", 0.0),
+                reason=info.get("reason", ""),
+                allowed_action=info.get("allowed_action", "reduce_or_close"),
+            ))
+
+        # Classify non-held stocks into buckets
+        trend_bucket: list[CandidateInBucket] = []
+        pullback_bucket: list[CandidateInBucket] = []
+        oversold_bucket: list[CandidateInBucket] = []
+        defensive_bucket: list[CandidateInBucket] = []
+        crypto_bucket: list[CandidateInBucket] = []
+        blocked_bucket: list[CandidateInBucket] = []
+
+        for s in sorted_by_score:
+            if s.ticker in held_tickers or s.ticker in exit_tickers:
+                continue
+
+            # Closed market stocks only go to blocked_or_warning
+            is_closed_market = s.market not in open_market_set
+
+            # Blocked or warning: non-tradable, limit-locked, OR closed market
+            if not s.tradable or s.limit_status != "normal" or is_closed_market:
+                reason = "closed_market" if is_closed_market else (
+                    f"limit_status={s.limit_status}" if not s.tradable else s.limit_status
+                )
+                blocked_bucket.append(CandidateInBucket(
+                    bucket=CandidateBucket.BLOCKED_OR_WARNING,
+                    ticker=s.ticker,
+                    market=s.market,
+                    price=s.price,
+                    score=s.composite,
+                    tradable=False if is_closed_market else s.tradable,
+                    reason=reason,
+                    allowed_action="closed" if is_closed_market else "check_tradability",
+                ))
+                continue
+
+            # Skip closed market stocks from new candidate buckets
+            if is_closed_market:
+                continue
+
+            # Crypto candidates
+            if s.market == Market.CRYPTO:
+                crypto_bucket.append(CandidateInBucket(
+                    bucket=CandidateBucket.CRYPTO_CANDIDATES,
+                    ticker=s.ticker,
+                    market=s.market,
+                    price=s.price,
+                    score=s.composite,
+                    chg_1h=s.chg_1h,
+                    chg_1d=s.chg_1d,
+                    chg_5d=s.chg_5d,
+                    rsi=s.rsi,
+                    trend=s.trend,
+                    volatility=s.volatility_rank,
+                    liquidity=s.volume_rank,
+                ))
+                continue
+
+            # Trend leaders: high score + strong trend
+            if s.composite >= 0.5 and s.trend in ("UU", "UD"):
+                trend_bucket.append(CandidateInBucket(
+                    bucket=CandidateBucket.TREND_LEADERS,
+                    ticker=s.ticker,
+                    market=s.market,
+                    price=s.price,
+                    score=s.composite,
+                    chg_1h=s.chg_1h,
+                    chg_1d=s.chg_1d,
+                    chg_5d=s.chg_5d,
+                    rsi=s.rsi,
+                    trend=s.trend,
+                    cost_bps=self._market_cost_bps(s.market),
+                    recent_bars=s.recent_bars,
+                ))
+                continue
+
+            # Pullback continuation: good trend but short-term pullback
+            if s.trend in ("UU", "UD") and s.chg_1d < 0 and s.rsi > 35:
+                pullback_bucket.append(CandidateInBucket(
+                    bucket=CandidateBucket.PULLBACK_CONTINUATION,
+                    ticker=s.ticker,
+                    market=s.market,
+                    price=s.price,
+                    score=s.composite,
+                    chg_1d=s.chg_1d,
+                    chg_5d=s.chg_5d,
+                    rsi=s.rsi,
+                    trend=s.trend,
+                    pullback_note=f"1d={s.chg_1d:+.1f}%",
+                ))
+                continue
+
+            # Oversold reversal: RSI < 35, negative 5d
+            if s.rsi < 35 and s.chg_5d < 0:
+                oversold_bucket.append(CandidateInBucket(
+                    bucket=CandidateBucket.OVERSOLD_REVERSAL,
+                    ticker=s.ticker,
+                    market=s.market,
+                    price=s.price,
+                    score=s.composite,
+                    chg_1d=s.chg_1d,
+                    chg_5d=s.chg_5d,
+                    rsi=s.rsi,
+                    trend=s.trend,
+                    stabilization="RSI recovering" if s.rsi > 25 else "deeply oversold",
+                    risk_note="High risk — reversal may fail",
+                ))
+                continue
+
+            # Low vol defensive: low ATR, low drawdown
+            if s.atr < 0.5:  # ATR% < 0.5%
+                defensive_bucket.append(CandidateInBucket(
+                    bucket=CandidateBucket.LOW_VOL_DEFENSIVE,
+                    ticker=s.ticker,
+                    market=s.market,
+                    price=s.price,
+                    score=s.composite,
+                    chg_5d=s.chg_5d,
+                    atr_pct=s.atr,
+                    drawdown_pct=0.0,  # TODO: compute from peak
+                    cost_bps=self._market_cost_bps(s.market),
+                ))
+                continue
+
+            # Default: if good trend, put in trend_leaders; otherwise skip
+            if s.composite >= 0.4:
+                trend_bucket.append(CandidateInBucket(
+                    bucket=CandidateBucket.TREND_LEADERS,
+                    ticker=s.ticker,
+                    market=s.market,
+                    price=s.price,
+                    score=s.composite,
+                    chg_1h=s.chg_1h,
+                    chg_1d=s.chg_1d,
+                    chg_5d=s.chg_5d,
+                    rsi=s.rsi,
+                    trend=s.trend,
+                    cost_bps=self._market_cost_bps(s.market),
+                    recent_bars=s.recent_bars,
+                ))
+
+        # Sort each bucket by score
+        trend_bucket.sort(key=lambda x: x.score, reverse=True)
+        pullback_bucket.sort(key=lambda x: x.score, reverse=True)
+        oversold_bucket.sort(key=lambda x: x.score, reverse=True)
+        defensive_bucket.sort(key=lambda x: x.score, reverse=True)
+        crypto_bucket.sort(key=lambda x: x.score, reverse=True)
+
+        return CandidateBuckets(
+            held_positions=held_bucket,
+            exit_watch=exit_bucket,
+            trend_leaders=trend_bucket,
+            pullback_continuation=pullback_bucket,
+            oversold_reversal=oversold_bucket,
+            low_vol_defensive=defensive_bucket,
+            crypto_candidates=crypto_bucket,
+            blocked_or_warning=blocked_bucket,
+        )
+
+    @staticmethod
+    def _market_cost_bps(market: Market) -> float:
+        """Approximate round-trip cost in bps per market."""
+        return {
+            Market.US: 16.0,   # 3+5+5+3 commission+slippage both sides
+            Market.HK: 40.0,   # higher fees + stamp
+            Market.CN: 26.0,   # commission + tax
+            Market.CRYPTO: 40.0,  # spread + slippage
+        }.get(market, 30.0)
 
     def _score_stock(
         self, market: Market, symbol: str,

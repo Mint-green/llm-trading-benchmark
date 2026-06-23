@@ -52,6 +52,54 @@ class Tradability(str, Enum):
     SELL_ONLY = "sell_only"  # e.g. limit-up: can sell, cannot buy
 
 
+class CandidateBucket(str, Enum):
+    """Candidate bucket types for structured candidate presentation."""
+    HELD_POSITIONS = "held_positions"
+    EXIT_WATCH = "exit_watch"
+    TREND_LEADERS = "trend_leaders"
+    PULLBACK_CONTINUATION = "pullback_continuation"
+    OVERSOLD_REVERSAL = "oversold_reversal"
+    LOW_VOL_DEFENSIVE = "low_vol_defensive"
+    CRYPTO_CANDIDATES = "crypto_candidates"
+    BLOCKED_OR_WARNING = "blocked_or_warning"
+
+
+class DecisionType(str, Enum):
+    """Decision types for the scheduling system."""
+    AUTO_HOLD = "auto_hold"
+    FULL_DECISION = "full_decision"
+    FOCUSED_POSITION = "focused_position_decision"
+    FOCUSED_MARKET_RISK = "focused_market_or_risk_decision"
+
+
+class PlanAction(str, Enum):
+    """Plan update actions."""
+    CREATE = "create"
+    UPDATE = "update"
+    CLOSE = "close"
+    NO_CHANGE = "no_change"
+
+
+class TriggerType(str, Enum):
+    """Structured trigger types for plan monitoring."""
+    PRICE_MOVE_PCT = "price_move_pct"
+    ATR_MOVE = "atr_move"
+    PNL_PCT = "pnl_pct"
+    TRAILING_DRAWDOWN_PCT = "trailing_drawdown_pct"
+    TRAILING_ATR = "trailing_atr"
+    BARS_ELAPSED = "bars_elapsed"
+    REGIME_CHANGE = "regime_change"
+    ASSET_STATUS_CHANGE = "asset_status_change"
+    MARGIN_RISK_CHANGE = "margin_risk_change"
+
+
+class RiskMode(str, Enum):
+    """Market risk regime."""
+    GREEN = "GREEN"
+    YELLOW = "YELLOW"
+    RED = "RED"
+
+
 # ============================================================
 # Market configuration dataclasses
 # ============================================================
@@ -218,3 +266,208 @@ class BenchmarkResult:
     total_llm_calls: int
     decision_log: list[dict[str, Any]]
     portfolio_history: list[PortfolioSnapshot]
+
+
+# ============================================================
+# Candidate bucket types
+# ============================================================
+
+@dataclass
+class CandidateInBucket:
+    """A candidate placed in a specific bucket."""
+    bucket: CandidateBucket
+    ticker: str
+    market: Market
+    price: float
+    score: float  # composite score from screener
+    chg_1h: float = 0.0
+    chg_1d: float = 0.0
+    chg_5d: float = 0.0
+    rsi: float = 50.0
+    trend: str = ""
+    tradable: bool = True
+    # Extra fields depending on bucket
+    pnl_pct: float = 0.0       # for held_positions, exit_watch
+    pct_nav: float = 0.0       # for held_positions, exit_watch
+    hold_bars: int = 0         # for held_positions
+    sellable: bool = True      # for held_positions
+    plan_status: str = ""      # for held_positions
+    risk_note: str = ""        # for held_positions, blocked_or_warning
+    reason: str = ""           # for exit_watch, blocked_or_warning
+    allowed_action: str = ""   # for exit_watch, blocked_or_warning
+    cost_bps: float = 0.0      # for trend_leaders, low_vol_defensive
+    pullback_note: str = ""    # for pullback_continuation
+    stabilization: str = ""    # for oversold_reversal
+    atr_pct: float = 0.0       # for low_vol_defensive
+    drawdown_pct: float = 0.0  # for low_vol_defensive
+    volatility: float = 0.0    # for crypto_candidates
+    liquidity: float = 0.0     # for crypto_candidates
+    recent_bars: str = ""      # for trend_leaders
+
+
+@dataclass
+class CandidateBuckets:
+    """All candidate buckets for a decision point."""
+    held_positions: list[CandidateInBucket]
+    exit_watch: list[CandidateInBucket]
+    trend_leaders: list[CandidateInBucket]
+    pullback_continuation: list[CandidateInBucket]
+    oversold_reversal: list[CandidateInBucket]
+    low_vol_defensive: list[CandidateInBucket]
+    crypto_candidates: list[CandidateInBucket]
+    blocked_or_warning: list[CandidateInBucket]
+
+
+# ============================================================
+# Portfolio target (target_pct_nav system)
+# ============================================================
+
+@dataclass
+class PortfolioTarget:
+    """LLM's target for a position (target_pct_nav system)."""
+    symbol: str
+    asset_type: str = "equity"  # equity, crypto, gold_spot, oil_proxy, cash
+    target_pct_nav: float = 0.0  # fraction of NAV (0.03 = 3%)
+    priority: int = 1
+    max_cost_bps: float = 35.0
+    reason: str = ""
+
+
+# ============================================================
+# Plan system
+# ============================================================
+
+@dataclass
+class PlanTrigger:
+    """A structured trigger for plan monitoring."""
+    trigger_type: TriggerType
+    direction: str = ""        # "up" or "down"
+    anchor: str = ""           # "last_review_price", "peak_since_entry"
+    threshold_pct: float = 0.0
+    atr_multiple: float = 0.0
+    operator: str = ""         # "<=", ">=" for pnl_pct
+    since: str = ""            # "last_review" for bars_elapsed
+    bars: int = 0              # for bars_elapsed
+    peak_anchor: str = ""      # for trailing_drawdown_pct
+    atr_source: str = ""       # for atr_move
+
+
+@dataclass
+class ActivePlan:
+    """An active trading plan for a position."""
+    plan_id: str
+    symbol: str
+    position_id: str = ""
+    status: str = "active"  # active, closed
+    side: str = "long"
+    entry_time: str = ""
+    entry_price: float = 0.0
+    current_pct_nav: float = 0.0
+    entry_reason: str = ""
+    plan_version: int = 1
+    last_review_time: str = ""
+    last_review_price: float = 0.0
+    atr_at_review: float = 0.0
+    peak_since_entry: float = 0.0
+    peak_since_last_review: float = 0.0
+    intended_horizon_bars: int = 36
+    plan_note: str = ""
+    triggers: list[PlanTrigger] = field(default_factory=list)
+
+
+# ============================================================
+# Memory system
+# ============================================================
+
+@dataclass
+class WatchlistItem:
+    """An item on the watchlist."""
+    symbol: str
+    reason: str = ""
+    desired_condition: dict = field(default_factory=dict)  # e.g. {"type": "rsi_range", "min": 45, "max": 65}
+    source_event_id: str = ""
+    created_at: str = ""
+    expires_at: str = ""
+
+
+@dataclass
+class AvoidItem:
+    """An item on the avoid/cooldown list."""
+    symbol: str
+    reason: str = ""
+    source_event_id: str = ""
+    created_at: str = ""
+    expires_at: str = ""
+
+
+@dataclass
+class DailyThesis:
+    """The daily market thesis."""
+    text: str = ""
+    confidence: float = 0.0
+    version: int = 1
+    created_at: str = ""
+    expires_at: str = ""
+
+
+@dataclass
+class RecentActivity:
+    """Recent activity summary for prompt injection."""
+    non_hold_decisions: list[str] = field(default_factory=list)  # last 3
+    focused_decisions: list[str] = field(default_factory=list)   # last 2
+    execution_feedback: list[str] = field(default_factory=list)  # last 3
+    risk_state_changes: list[str] = field(default_factory=list)  # last 1
+
+
+@dataclass
+class ExecutionFeedback:
+    """Feedback from a trade execution."""
+    symbol: str
+    requested_target_pct_nav: float
+    filled_target_pct_nav: float
+    status: str  # OK, ADJUSTED, FAILED
+    reason: str = ""
+    fees_usd: float = 0.0
+    slippage_usd: float = 0.0
+    timestamp: str = ""
+
+
+@dataclass
+class SessionSummary:
+    """Summary for a market session (e.g., HK close)."""
+    market: str
+    session_date: str
+    market_read: str = ""
+    model_actions: list[str] = field(default_factory=list)
+    open_positions: list[dict] = field(default_factory=list)
+    risk_notes: list[str] = field(default_factory=list)
+    created_at: str = ""
+
+
+@dataclass
+class DailySummary:
+    """Daily global summary at benchmark boundary."""
+    date: str
+    nav_start: float = 0.0
+    nav_end: float = 0.0
+    daily_return_pct: float = 0.0
+    market_read: str = ""
+    major_decisions: list[str] = field(default_factory=list)
+    what_worked: list[str] = field(default_factory=list)
+    what_failed: list[str] = field(default_factory=list)
+    carryover_positions: list[dict] = field(default_factory=list)
+    avoid_next_day: list[dict] = field(default_factory=list)
+    behavior: dict = field(default_factory=dict)
+    created_at: str = ""
+
+
+@dataclass
+class MemoryState:
+    """Complete memory state injected into prompt."""
+    previous_daily_summary: DailySummary | None = None
+    daily_thesis: DailyThesis | None = None
+    recent_activity: RecentActivity = field(default_factory=RecentActivity)
+    watchlist: list[WatchlistItem] = field(default_factory=list)
+    avoid_list: list[AvoidItem] = field(default_factory=list)
+    recent_feedback: list[ExecutionFeedback] = field(default_factory=list)
+    rolling_behavior_notes: list[str] = field(default_factory=list)

@@ -1,14 +1,16 @@
 """
-ToolSystem — provides tools the agent can call during rounds 2-7.
+ToolSystem — provides read-only query tools for the agent.
 
-Tools:
-  - market_overview(): Current market index status
-  - query_stock(ticker): Detailed stock data
-  - query_macro(): Macro economic context (placeholder)
-  - query_fx(): Current FX rates
-  - query_position(): Detailed position info
-  - query_history(ticker, days): Historical price data
-  - query_news(ticker): News (reserved)
+7 tools (v3 design):
+  - screen_universe:    Screen universe by market, bucket, filters
+  - query_asset:        Query detailed asset info
+  - query_position:     Query position details
+  - query_history:      Query historical price data
+  - query_market_overview: Query market-level overview
+  - query_fx:           Query FX rates and cash balances
+  - query_futures_contract: Query futures contract info (reserved)
+
+All tools are read-only. Trade execution happens via final JSON output.
 """
 
 from __future__ import annotations
@@ -17,6 +19,200 @@ from src.core.types import Market, PortfolioSnapshot, IndicatorSnapshot
 from src.core.interfaces import IToolSystem
 from src.data.provider import MarketDataProvider
 from src.data.features import FeatureGenerator
+
+
+# Tool schemas for function calling
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "screen_universe",
+            "description": "Screen the point-in-time investable universe using market, bucket, filters, and sorting rules. Read-only. Does not change portfolio or memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "market": {
+                        "type": "string",
+                        "enum": ["US", "CN", "HK", "CRYPTO", "ALL"],
+                        "description": "Market to screen"
+                    },
+                    "bucket": {
+                        "type": "string",
+                        "enum": [
+                            "trend_leaders", "pullback_continuation",
+                            "oversold_reversal", "low_vol_defensive",
+                            "volume_breakout", "custom",
+                        ],
+                        "description": "Candidate bucket type"
+                    },
+                    "filters": {
+                        "type": "object",
+                        "properties": {
+                            "rsi_min": {"type": "number"},
+                            "rsi_max": {"type": "number"},
+                            "min_1d_return": {"type": "number"},
+                            "min_5d_return": {"type": "number"},
+                            "max_atr_pct": {"type": "number"},
+                            "tradable_now": {"type": "boolean"},
+                            "exclude_current_positions": {"type": "boolean"},
+                        },
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "enum": ["score_total", "trend_score", "volume_rank", "cost_efficiency"],
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 30,
+                        "description": "Max results to return"
+                    },
+                },
+                "required": ["market", "bucket", "limit"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_asset",
+            "description": "Query point-in-time details for a specific tradable asset. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Asset ticker, e.g. AAPL.US, 0700.HK"},
+                    "fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "quote", "recent_bars", "indicators",
+                                "tradability", "cost", "lot_info",
+                            ],
+                        },
+                        "description": "Which fields to include"
+                    },
+                    "recent_bar_count": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 48,
+                        "description": "Number of recent bars to include"
+                    },
+                },
+                "required": ["symbol", "fields"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_position",
+            "description": "Query current position, plan, PnL, tradability, and execution history for a symbol. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Position ticker"},
+                    "include_plan": {"type": "boolean", "description": "Include active plan details"},
+                    "include_recent_executions": {"type": "boolean", "description": "Include recent trade history"},
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_history",
+            "description": "Query historical price and indicator data available at the decision timestamp. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Asset ticker"},
+                    "lookback_bars": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 500,
+                        "description": "Number of bars to look back"
+                    },
+                    "bar_size": {
+                        "type": "string",
+                        "enum": ["5m", "15m", "1h", "1d"],
+                        "description": "Bar granularity"
+                    },
+                    "fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["ohlcv", "returns", "rsi", "atr", "ema"],
+                        },
+                        "description": "Which fields to include"
+                    },
+                },
+                "required": ["symbol", "lookback_bars", "bar_size"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_market_overview",
+            "description": "Query point-in-time market overview, regime, breadth, volatility, and open/close status. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "markets": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["US", "CN", "HK", "CRYPTO"],
+                        },
+                        "description": "Markets to query"
+                    },
+                    "include_regime": {"type": "boolean", "description": "Include regime status"},
+                    "include_breadth": {"type": "boolean", "description": "Include breadth data"},
+                },
+                "required": ["markets"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_fx",
+            "description": "Query point-in-time FX rates, cash balances, and conversion costs. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "base_currency": {"type": "string", "description": "Base currency (e.g. USD)"},
+                    "quote_currency": {"type": "string", "description": "Quote currency (e.g. HKD)"},
+                    "include_cash_balances": {"type": "boolean", "description": "Include current cash positions"},
+                    "include_conversion_cost": {"type": "boolean", "description": "Include FX conversion cost"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_futures_contract",
+            "description": "Query current actual futures contract mapped from a continuous symbol. Read-only. (Reserved for future use)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "continuous_symbol": {"type": "string", "description": "Continuous futures symbol"},
+                    "fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["actual_contract", "price", "multiplier", "notional", "margin"],
+                        },
+                    },
+                },
+                "required": ["continuous_symbol"],
+            },
+        },
+    },
+]
 
 
 class ToolSystem(IToolSystem):
@@ -33,197 +229,302 @@ class ToolSystem(IToolSystem):
         self._get_snapshot = portfolio_snapshot_fn
 
     def get_tool_descriptions(self) -> list[dict]:
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": "market_overview",
-                    "description": "Get current market status and index overview",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "query_stock",
-                    "description": "Get detailed stock data including recent bars and indicators",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "ticker": {"type": "string", "description": "Stock ticker, e.g. AAPL.US, 0700.HK"},
-                        },
-                        "required": ["ticker"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "query_macro",
-                    "description": "Get macro economic context (interest rates, inflation, etc.)",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "query_fx",
-                    "description": "Get current FX rates",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "query_position",
-                    "description": "Get detailed position and portfolio info",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "query_history",
-                    "description": "Get historical price data for a stock",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "ticker": {"type": "string"},
-                            "days": {"type": "integer", "description": "Number of days of history", "default": 5},
-                        },
-                        "required": ["ticker"],
-                    },
-                },
-            },
-        ]
+        """Return tool schemas for function calling."""
+        return TOOL_SCHEMAS
 
     def execute_tool(
         self, name: str, args: dict, timestamp: str,
     ) -> str:
-        if name == "market_overview":
-            return self._market_overview(timestamp)
-        elif name == "query_stock":
-            return self._query_stock(args.get("ticker", ""), timestamp)
-        elif name == "query_macro":
-            return self._query_macro()
-        elif name == "query_fx":
-            return self._query_fx()
+        """Execute a tool and return result as string."""
+        if name == "screen_universe":
+            return self._screen_universe(args, timestamp)
+        elif name == "query_asset":
+            return self._query_asset(args, timestamp)
         elif name == "query_position":
-            return self._query_position(timestamp)
+            return self._query_position(args, timestamp)
         elif name == "query_history":
-            return self._query_history(args.get("ticker", ""), args.get("days", 5), timestamp)
-        elif name == "query_news":
-            return "(news not available in backtest mode)"
+            return self._query_history(args, timestamp)
+        elif name == "query_market_overview":
+            return self._query_market_overview(args, timestamp)
+        elif name == "query_fx":
+            return self._query_fx(args, timestamp)
+        elif name == "query_futures_contract":
+            return "(futures not available in current version)"
         else:
             return f"Unknown tool: {name}"
 
-    def _market_overview(self, timestamp: str) -> str:
-        snapshot = self._get_snapshot()
-        lines = ["Market Overview:"]
-        for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO]:
+    def _screen_universe(self, args: dict, timestamp: str) -> str:
+        """Screen universe by market, bucket, filters."""
+        market_str = args.get("market", "ALL")
+        bucket = args.get("bucket", "trend_leaders")
+        limit = args.get("limit", 10)
+        filters = args.get("filters", {})
+
+        # Determine markets to screen
+        if market_str == "ALL":
+            markets = [Market.US, Market.HK, Market.CN, Market.CRYPTO]
+        else:
+            market_map = {"US": Market.US, "HK": Market.HK, "CN": Market.CN, "CRYPTO": Market.CRYPTO}
+            markets = [market_map.get(market_str, Market.US)]
+
+        # Load bars and compute indicators
+        results = []
+        for market in markets:
             symbols = self._data.get_universe_symbols(market)
-            exposure = snapshot.market_exposure.get(market, 0)
-            lines.append(f"  {market.value}: {len(symbols)} stocks, exposure=${exposure:,.0f}")
+            for symbol in symbols:
+                bars = self._data.load_bars(market, symbol, "2025-10-01", timestamp)
+                if not bars:
+                    continue
+
+                snap = self._features.compute(bars, timestamp)
+                if snap is None:
+                    continue
+
+                # Apply filters
+                rsi_min = filters.get("rsi_min", 0)
+                rsi_max = filters.get("rsi_max", 100)
+                if snap.rsi < rsi_min or snap.rsi > rsi_max:
+                    continue
+
+                results.append({
+                    "symbol": symbol,
+                    "market": market.value,
+                    "price": snap.price,
+                    "rsi": snap.rsi,
+                    "trend": snap.trend,
+                    "chg_1h": snap.chg_1h,
+                    "chg_1d": snap.chg_1d,
+                    "atr_pct": snap.atr_pct,
+                })
+
+        # Sort by score (simplified: by absolute change)
+        sort_by = args.get("sort_by", "score_total")
+        if sort_by == "trend_score":
+            results.sort(key=lambda x: abs(x["chg_1d"]), reverse=True)
+        else:
+            results.sort(key=lambda x: abs(x["chg_1h"]) + abs(x["chg_1d"]), reverse=True)
+
+        results = results[:limit]
+
+        # Format output
+        lines = [f"[SCREEN] {market_str} | bucket={bucket} | {len(results)} results"]
+        lines.append("symbol|mkt|price|rsi|trend|1h_chg|1d_chg|atr%")
+        for r in results:
+            lines.append(
+                f"{r['symbol']}|{r['market']}|{r['price']:.2f}|"
+                f"{r['rsi']:.0f}|{r['trend']}|"
+                f"{r['chg_1h']:+.2f}|{r['chg_1d']:+.2f}|{r['atr_pct']:.2f}"
+            )
         return "\n".join(lines)
 
-    def _query_stock(self, ticker: str, timestamp: str) -> str:
-        if not ticker:
-            return "Error: ticker is required"
+    def _query_asset(self, args: dict, timestamp: str) -> str:
+        """Query detailed asset info."""
+        symbol = args.get("symbol", "")
+        fields = args.get("fields", ["quote", "indicators"])
+        bar_count = args.get("recent_bar_count", 5)
 
-        # Determine market from ticker suffix
-        market = self._ticker_to_market(ticker)
+        if not symbol:
+            return "Error: symbol is required"
+
+        market = self._ticker_to_market(symbol)
         if market is None:
-            return f"Error: cannot determine market for {ticker}"
+            return f"Error: cannot determine market for {symbol}"
 
-        bars = self._data.load_bars(market, ticker, "2025-10-01", timestamp)
+        bars = self._data.load_bars(market, symbol, "2025-10-01", timestamp)
         if not bars:
-            return f"No data for {ticker}"
+            return f"No data for {symbol}"
 
-        # Compute indicators
         snap = self._features.compute(bars, timestamp)
         if snap is None:
-            return f"Insufficient data for {ticker} (need more bars)"
+            return f"Insufficient data for {symbol}"
 
-        # Format recent bars
-        recent = bars[-5:]
-        lines = [f"[{ticker}] Detailed:"]
-        lines.append(f"  Price: ${snap.price:.2f}")
-        lines.append(f"  RSI: {snap.rsi:.1f}  ATR%: {snap.atr_pct:.2f}%  Trend: {snap.trend}")
-        lines.append(f"  Chg: 5m={snap.chg_5m:+.2f}% 1h={snap.chg_1h:+.2f}% 1d={snap.chg_1d:+.2f}%")
-        lines.append(f"  BB pos: {snap.bb_position:.2f}  RelVol: {snap.rel_volume:.1f}x")
-        lines.append("  Recent bars:")
-        for b in recent:
-            lines.append(f"    {b.timestamp}: O={b.open:.2f} H={b.high:.2f} L={b.low:.2f} C={b.close:.2f}")
+        lines = [f"[ASSET] {symbol} @ {timestamp}"]
+
+        if "quote" in fields:
+            lines.append(f"  Price: {snap.price:.2f}")
+            lines.append(f"  Chg: 5m={snap.chg_5m:+.2f}% 1h={snap.chg_1h:+.2f}% 1d={snap.chg_1d:+.2f}%")
+
+        if "indicators" in fields:
+            lines.append(f"  RSI: {snap.rsi:.1f}  ATR%: {snap.atr_pct:.2f}%  Trend: {snap.trend}")
+            lines.append(f"  BB pos: {snap.bb_position:.2f}  RelVol: {snap.rel_volume:.1f}x")
+
+        if "recent_bars" in fields and bar_count > 0:
+            recent = bars[-bar_count:]
+            lines.append(f"  Recent {len(recent)} bars:")
+            for b in recent:
+                lines.append(f"    {b.timestamp}: O={b.open:.2f} H={b.high:.2f} L={b.low:.2f} C={b.close:.2f}")
+
+        if "tradability" in fields:
+            lines.append(f"  Tradable: yes")  # TODO: check AssetStatusProvider
+
+        if "cost" in fields:
+            cost_map = {"US": "3+5 bps", "HK": "15-30 bps", "CN": "5-15 bps", "CRYPTO": "5-20 bps"}
+            lines.append(f"  Est. cost: {cost_map.get(market.value, 'unknown')}")
 
         return "\n".join(lines)
 
-    def _query_macro(self) -> str:
-        # Placeholder - would integrate with macro data source
-        return "Macro: (no live macro data in backtest mode. Assume stable conditions.)"
+    def _query_position(self, args: dict, timestamp: str) -> str:
+        """Query position details."""
+        symbol = args.get("symbol", "")
+        include_plan = args.get("include_plan", False)
+        include_executions = args.get("include_recent_executions", False)
 
-    def _query_fx(self) -> str:
         snapshot = self._get_snapshot()
-        lines = ["FX Rates (per 1 USD):"]
-        for currency, rate in snapshot.fx_rates.items():
-            if currency != "USD":
-                lines.append(f"  USD/{currency}: {rate:.2f}")
+
+        # Find position
+        pos = None
+        for key, p in snapshot.positions.items():
+            if p.symbol == symbol:
+                pos = p
+                break
+
+        if pos is None:
+            return f"No position in {symbol}"
+
+        pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost > 0 else 0
+        pos_pct = pos.market_value / snapshot.total_nav * 100 if snapshot.total_nav > 0 else 0
+
+        lines = [f"[POSITION] {symbol}"]
+        lines.append(f"  Market: {pos.market.value}")
+        lines.append(f"  Quantity: {pos.quantity}")
+        lines.append(f"  Avg cost: {pos.avg_cost:.2f}")
+        lines.append(f"  Current: {pos.current_price:.2f}")
+        lines.append(f"  PnL: {pnl_pct:+.1f}% (${pos.unrealized_pnl:+.2f})")
+        lines.append(f"  % NAV: {pos_pct:.1f}%")
+
+        if include_plan:
+            lines.append(f"  Plan: (no active plan)")  # TODO: get from MemoryManager
+
+        if include_executions:
+            lines.append(f"  Recent executions: (not available)")
+
         return "\n".join(lines)
 
-    def _query_position(self, timestamp: str) -> str:
-        snapshot = self._get_snapshot()
-        lines = [f"Portfolio @ {timestamp}:"]
-        lines.append(f"  NAV: ${snapshot.total_nav:,.2f}  Cash: ${snapshot.cash:,.2f}")
+    def _query_history(self, args: dict, timestamp: str) -> str:
+        """Query historical price data."""
+        symbol = args.get("symbol", "")
+        lookback = args.get("lookback_bars", 48)
+        bar_size = args.get("bar_size", "5m")
+        fields = args.get("fields", ["ohlcv"])
 
-        if not snapshot.positions:
-            lines.append("  No positions")
-        else:
-            for key, pos in snapshot.positions.items():
-                pnl = pos.unrealized_pnl
-                pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost > 0 else 0
-                lines.append(
-                    f"  {pos.symbol}({pos.market.value}): {pos.quantity}sh "
-                    f"avg=${pos.avg_cost:.2f} now=${pos.current_price:.2f} "
-                    f"PnL=${pnl:+.2f} ({pnl_pct:+.1f}%)"
-                )
+        if not symbol:
+            return "Error: symbol is required"
 
-        return "\n".join(lines)
-
-    def _query_history(self, ticker: str, days: int, timestamp: str) -> str:
-        if not ticker:
-            return "Error: ticker is required"
-
-        market = self._ticker_to_market(ticker)
+        market = self._ticker_to_market(symbol)
         if market is None:
-            return f"Error: cannot determine market for {ticker}"
+            return f"Error: cannot determine market for {symbol}"
 
-        # Approximate: 48 bars/day for equities, 288 for crypto
-        bars_per_day = 288 if market == Market.CRYPTO else 48
-        lookback_bars = days * bars_per_day
-
-        bars = self._data.load_bars(market, ticker, "2025-10-01", timestamp)
+        bars = self._data.load_bars(market, symbol, "2025-10-01", timestamp)
         if not bars:
-            return f"No data for {ticker}"
+            return f"No data for {symbol}"
 
-        recent = bars[-lookback_bars:]
+        # Adjust lookback based on bar_size
+        if bar_size == "15m":
+            lookback = lookback * 3
+        elif bar_size == "1h":
+            lookback = lookback * 12
+        elif bar_size == "1d":
+            lookback = lookback * 48
+
+        recent = bars[-lookback:]
         if not recent:
-            return f"No recent data for {ticker}"
+            return f"No recent data for {symbol}"
 
         first = recent[0]
         last = recent[-1]
         change_pct = (last.close - first.close) / first.close * 100 if first.close > 0 else 0
 
-        high = max(b.high for b in recent)
-        low = min(b.low for b in recent)
+        lines = [f"[HISTORY] {symbol} | {bar_size} | {len(recent)} bars"]
+        lines.append(f"  Range: {first.timestamp} → {last.timestamp}")
+        lines.append(f"  Change: {change_pct:+.2f}%")
 
-        lines = [f"[{ticker}] {days}-day history:"]
-        lines.append(f"  Range: ${low:.2f} - ${high:.2f}")
-        lines.append(f"  Change: {change_pct:+.2f}% ({first.close:.2f} -> {last.close:.2f})")
-        lines.append(f"  Bars: {len(recent)}")
+        if "ohlcv" in fields:
+            lines.append("  Last 5 bars:")
+            for b in recent[-5:]:
+                lines.append(f"    {b.timestamp}: O={b.open:.2f} H={b.high:.2f} L={b.low:.2f} C={b.close:.2f}")
+
+        if "returns" in fields:
+            returns = []
+            for i in range(1, min(6, len(recent))):
+                r = (recent[-i].close - recent[-i-1].close) / recent[-i-1].close * 100 if recent[-i-1].close > 0 else 0
+                returns.append(f"{r:+.2f}%")
+            lines.append(f"  Recent returns: {', '.join(returns)}")
+
+        return "\n".join(lines)
+
+    def _query_market_overview(self, args: dict, timestamp: str) -> str:
+        """Query market overview."""
+        markets = args.get("markets", ["US", "HK", "CN", "CRYPTO"])
+        include_regime = args.get("include_regime", True)
+        include_breadth = args.get("include_breadth", True)
+
+        market_map = {"US": Market.US, "HK": Market.HK, "CN": Market.CN, "CRYPTO": Market.CRYPTO}
+        snapshot = self._get_snapshot()
+
+        lines = [f"[MARKET_OVERVIEW] @ {timestamp}"]
+
+        for market_str in markets:
+            market = market_map.get(market_str)
+            if market is None:
+                continue
+
+            symbols = self._data.get_universe_symbols(market)
+            exposure = snapshot.market_exposure.get(market, 0)
+
+            # Compute market stats
+            up_count = 0
+            down_count = 0
+            total_chg = 0.0
+            count = 0
+
+            for symbol in symbols[:50]:  # sample first 50
+                bars = self._data.load_bars(market, symbol, "2025-10-01", timestamp)
+                if not bars:
+                    continue
+                snap = self._features.compute(bars, timestamp)
+                if snap is None:
+                    continue
+                if snap.chg_1d > 0:
+                    up_count += 1
+                else:
+                    down_count += 1
+                total_chg += snap.chg_1d
+                count += 1
+
+            avg_chg = total_chg / count if count > 0 else 0
+
+            lines.append(f"  {market_str}: {len(symbols)} stocks, exposure=${exposure:,.0f}")
+            if include_breadth:
+                lines.append(f"    Breadth: {up_count}↑/{down_count}↓, avg_chg={avg_chg:+.2f}%")
+            if include_regime:
+                regime = "GREEN" if avg_chg > -1 else "YELLOW" if avg_chg > -3 else "RED"
+                lines.append(f"    Regime: {regime}")
+
+        return "\n".join(lines)
+
+    def _query_fx(self, args: dict, timestamp: str) -> str:
+        """Query FX rates."""
+        snapshot = self._get_snapshot()
+        include_balances = args.get("include_cash_balances", False)
+        include_cost = args.get("include_conversion_cost", False)
+
+        lines = [f"[FX] @ {timestamp}"]
+        lines.append("  Rates (per 1 USD):")
+        for currency, rate in snapshot.fx_rates.items():
+            if currency != "USD":
+                lines.append(f"    USD/{currency}: {rate:.4f}")
+
+        if include_balances:
+            lines.append(f"  Cash: ${snapshot.cash:,.2f}")
+
+        if include_cost:
+            lines.append(f"  FX fee: ~5 bps per conversion")
 
         return "\n".join(lines)
 
     @staticmethod
     def _ticker_to_market(ticker: str) -> Market | None:
+        """Determine market from ticker suffix."""
         if ticker.endswith(".US"):
             return Market.US
         elif ticker.endswith(".HK"):

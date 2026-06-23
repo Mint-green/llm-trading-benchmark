@@ -2,6 +2,7 @@
 ConstraintEngine — validates orders against position limits.
 
 Checks: single position limit, market exposure limit, crypto exposure limit, cash availability.
+Includes tail_guard: block new buys/increases in last 15min before market close.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ class ConstraintEngine(IConstraintEngine):
 
     def __init__(self, config: Config, cooling_hours: float = 2.0, max_daily_trades: int = 25):
         self._limits = config.position_limits
+        self._config = config
         self._cooling_hours = cooling_hours
         self._max_daily_trades = max_daily_trades
         # Track last buy time per position: {key: timestamp_str}
@@ -25,12 +27,28 @@ class ConstraintEngine(IConstraintEngine):
         # Track SELLs per decision point to prevent panic selling
         self._sells_this_decision: int = 0
         self._last_decision_ts: str = ""
+        # Tail guard state
+        self._tail_guard_active: bool = False
+        self._tail_guard_markets: list[str] = []
 
     def reset_decision_state(self, timestamp: str) -> None:
         """Reset per-decision counters (call at start of each decision point)."""
         if timestamp[:16] != self._last_decision_ts[:16]:
             self._sells_this_decision = 0
             self._last_decision_ts = timestamp
+
+    def set_tail_guard(self, active: bool, markets: list[str]) -> None:
+        """Set tail guard state. Called by DecisionScheduler."""
+        self._tail_guard_active = active
+        self._tail_guard_markets = markets
+
+    def is_tail_guard_blocked(self, market: Market) -> bool:
+        """Check if a market is blocked by tail guard."""
+        if not self._tail_guard_active:
+            return False
+        if not self._config.tail_guard.enabled:
+            return False
+        return market.value in self._tail_guard_markets
 
     def record_buy(self, key: str, timestamp: str) -> None:
         """Record a buy for cooling period tracking."""
@@ -80,6 +98,21 @@ class ConstraintEngine(IConstraintEngine):
             return False, "price must be positive"
         if current_nav <= 0:
             return False, "NAV is zero or negative"
+
+        # 0. Tail guard: block new buys in close window
+        if self.is_tail_guard_blocked(market):
+            key = f"{market.value}:{symbol}"
+            existing = current_positions.get(key)
+            if existing is None or existing.quantity <= 0:
+                return False, (
+                    f"tail_guard: new buys blocked for {market.value} in close window "
+                    f"(last {self._config.tail_guard.minutes_before_close}min before market close)"
+                )
+            # If position exists, this is an increase — also blocked
+            if self._config.tail_guard.block_increase_position:
+                return False, (
+                    f"tail_guard: position increases blocked for {market.value} in close window"
+                )
 
         cost = price * quantity
 

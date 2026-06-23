@@ -5,6 +5,7 @@ Wires all modules together and runs the backtest loop.
 """
 
 from __future__ import annotations
+import json
 import os
 import time
 from typing import Any
@@ -12,7 +13,7 @@ from typing import Any
 from src.core.config import Config
 from src.core.types import (
     Market, OrderSide, PortfolioSnapshot, TradeOrder, Decision,
-    AgentRound, BenchmarkResult,
+    AgentRound, BenchmarkResult, DecisionType, RiskMode,
 )
 from src.data.provider import MarketDataProvider
 from src.data.universe import UniverseRegistry
@@ -27,12 +28,16 @@ from src.portfolio.market_rules import MarketRuleEngine
 from src.portfolio.execution import ExecutionEngine
 from src.portfolio.settlement import SettlementEngine
 from src.portfolio.portfolio import PortfolioEngine
+from src.portfolio.trigger_engine import TriggerEngine
 from src.agent.context import ContextBuilder
 from src.agent.tools import ToolSystem
 from src.agent.runner import AgentRunner
+from src.agent.memory_manager import MemoryManager
 from src.evaluation.metrics import MetricsEngine
 from src.evaluation.behavior import BehaviorAnalyzer
 from .logging import ExperimentLogger
+from .scheduler import DecisionScheduler, DecisionRequest
+from .event_detector import EventDetector
 
 
 class ExperimentRunner:
@@ -67,6 +72,20 @@ class ExperimentRunner:
             self.execution, self.settlement, self.market_rules,
         )
 
+        # Trigger engine
+        self.trigger_engine = TriggerEngine(
+            self.config.trigger_config, self.config.crypto_trigger_config,
+        )
+
+        # Memory manager
+        self.memory = MemoryManager()
+
+        # Decision scheduler
+        self.scheduler = DecisionScheduler(self.config)
+
+        # Event detector
+        self.event_detector = EventDetector(self.config, self.trigger_engine, self.features)
+
         # Agent layer
         self.context_builder = ContextBuilder(max_rounds=self.config.max_agent_rounds)
         self.tool_system = ToolSystem(
@@ -95,6 +114,9 @@ class ExperimentRunner:
 
         # Cache for price lookup
         self._all_bars_cache: dict[Market, dict[str, list]] = {}
+
+        # Risk mode
+        self._risk_mode = RiskMode.GREEN
 
     def run(self) -> BenchmarkResult:
         """Run the complete benchmark."""
@@ -160,19 +182,66 @@ class ExperimentRunner:
             snapshot = self.portfolio.get_snapshot(ts)
             snapshot.fx_rates = fx_rates
 
-            # Check if any stock market is open (skip crypto-only periods)
+            # Get open/closed markets
+            open_markets = self.scheduler.get_open_markets(ts)
+            closed_markets = self.scheduler.get_closed_markets(ts)
+
+            # Skip crypto-only periods (no stock markets open, not weekend)
             if not self._any_stock_market_open(ts):
                 continue
 
-            # Skip end-of-session (20:00 UTC = last US hour) to avoid impulsive closing trades
-            if self._is_end_of_session(ts):
-                if self._any_stock_market_open(ts):
+            # Detect events
+            plans = self.memory.get_all_plans()
+            trigger_events, market_events, risk_events = self.event_detector.detect(
+                ts, snapshot, all_bars, plans, open_markets, closed_markets, self._risk_mode,
+            )
+
+            # Update plan peaks
+            for symbol, plan in plans.items():
+                pos = None
+                for key, p in snapshot.positions.items():
+                    if p.symbol == symbol:
+                        pos = p
+                        break
+                if pos:
+                    self.memory.update_plan_peak(symbol, pos.current_price)
+
+            # Expire memory items
+            self.memory.expire_thesis(ts)
+            self.memory.expire_watchlist(ts)
+            self.memory.expire_avoid(ts)
+
+            # Schedule decision
+            decision_request = self.scheduler.schedule(
+                ts, open_markets, closed_markets, trigger_events, self._risk_mode,
+            )
+
+            # Set tail guard state
+            self.portfolio._constraints.set_tail_guard(
+                decision_request.tail_guard_active,
+                decision_request.tail_guard_markets,
+            )
+
+            # Handle auto_hold (no LLM call)
+            if decision_request.decision_type == DecisionType.AUTO_HOLD:
+                # Still log snapshot
+                self.logger.log_snapshot(snapshot)
+                portfolio_history.append(snapshot)
+
+                # Print progress (less verbose for auto_hold)
+                if i % 12 == 0:  # print every ~60min
                     print(
-                        f"[{ts}] decision={decision_count+1}/{len(timestamps)} | "
-                        f"calls=0 | latency=0.0s | action=hold (end of session) | "
-                        f"trades= | NAV=${self.portfolio.nav:,.0f}",
+                        f"[{ts}] auto_hold | NAV=${self.portfolio.nav:,.0f}",
                         flush=True,
                     )
+                continue
+
+            # Handle end-of-session (last bar at market close)
+            if self._is_end_of_session(ts):
+                # Generate session summary for closing market
+                for market in closed_markets:
+                    if market != Market.CRYPTO:
+                        self._generate_session_summary(market, ts, snapshot)
                 continue
 
             # Build alerts (position RSI extremes only — actionable signals)
@@ -181,39 +250,114 @@ class ExperimentRunner:
             # Get index returns
             index_returns = self.index_provider.get_all_index_returns(ts)
 
-            # Build 3-layer context using screener
-            held_tickers = {pos.symbol: pos.market for pos in snapshot.positions.values()}
-            candidates = self.screener.screen(all_bars, ts, held_tickers=held_tickers)
+            # Build context based on decision type
+            if decision_request.decision_type == DecisionType.FULL_DECISION:
+                # Use v3-style bucketed context
+                held_info = {}
+                exit_info = {}
+                for key, pos in snapshot.positions.items():
+                    pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost) if pos.avg_cost > 0 else 0
+                    pos_pct = pos.market_value / snapshot.total_nav if snapshot.total_nav > 0 else 0
+                    held_info[pos.symbol] = {
+                        "market": pos.market,
+                        "price": pos.current_price,
+                        "score": 0.0,
+                        "pnl_pct": pnl_pct,
+                        "pct_nav": pos_pct,
+                        "hold_bars": 0,
+                        "sellable": key not in snapshot.frozen_keys,
+                        "plan_status": "",
+                        "risk_note": "",
+                    }
 
-            # Full universe list (restored per system-design.md Layer 1)
-            universe_dict = {
-                Market.US: self.universe.get_symbols(Market.US),
-                Market.HK: self.universe.get_symbols(Market.HK),
-                Market.CN: self.universe.get_symbols(Market.CN),
-                Market.CRYPTO: self.universe.get_symbols(Market.CRYPTO),
-            }
-            universe_str = ContextBuilder.build_universe_layer(universe_dict)
+                buckets = self.screener.screen_into_buckets(
+                    all_bars, ts, held_positions=held_info, exit_watch_positions=exit_info,
+                    open_markets=open_markets,
+                )
 
-            market_summary = ContextBuilder.build_market_summary_from_universe(
-                all_bars, self.features, ts, index_returns=index_returns,
-            )
-            candidate_str, _ = ContextBuilder.build_candidate_layer(candidates, detail_count=0)
-            stock_context = market_summary + "\n\n" + candidate_str
+                market_summary = ContextBuilder.build_market_summary_from_universe(
+                    all_bars, self.features, ts, index_returns=index_returns,
+                    open_markets=open_markets,
+                )
 
-            # Run agent with retry mechanism
+                memory_state = self.memory.get_memory_state()
+
+                messages = self.context_builder.build_full_decision(
+                    timestamp=ts,
+                    snapshot=snapshot,
+                    market_summary=market_summary,
+                    buckets=buckets,
+                    memory_state=memory_state,
+                    risk_mode=self._risk_mode,
+                    open_markets=[m.value for m in open_markets],
+                    closed_markets=[m.value for m in closed_markets],
+                    benchmark_day=0,
+                    bar_index=i,
+                    round_num=1,
+                )
+            else:
+                # Focused decision — use simpler context
+                universe_dict = {
+                    Market.US: self.universe.get_symbols(Market.US),
+                    Market.HK: self.universe.get_symbols(Market.HK),
+                    Market.CN: self.universe.get_symbols(Market.CN),
+                    Market.CRYPTO: self.universe.get_symbols(Market.CRYPTO),
+                }
+                universe_str = ContextBuilder.build_universe_layer(universe_dict)
+
+                market_summary = ContextBuilder.build_market_summary_from_universe(
+                    all_bars, self.features, ts, index_returns=index_returns,
+                )
+
+                held_tickers = {pos.symbol: pos.market for pos in snapshot.positions.values()}
+                candidates = self.screener.screen(all_bars, ts, held_tickers=held_tickers)
+                candidate_str, _ = ContextBuilder.build_candidate_layer(candidates, detail_count=0)
+                stock_context = market_summary + "\n\n" + candidate_str
+
+                # Build focused prompt
+                if decision_request.scope_symbols:
+                    symbol = decision_request.scope_symbols[0]
+                    plan = self.memory.get_plan(symbol)
+                    trigger_detail = {}
+                    if decision_request.trigger_events:
+                        te = decision_request.trigger_events[0]
+                        trigger_detail = te.trigger_detail
+
+                    messages = self.context_builder.build_focused_position_decision(
+                        timestamp=ts,
+                        snapshot=snapshot,
+                        symbol=symbol,
+                        plan=plan,
+                        trigger_detail=trigger_detail,
+                        priority=decision_request.priority,
+                        round_num=1,
+                    )
+                else:
+                    messages = self.context_builder.build_focused_market_decision(
+                        timestamp=ts,
+                        snapshot=snapshot,
+                        event_type=decision_request.trigger_events[0].trigger_type.value if decision_request.trigger_events else "unknown",
+                        event_detail=decision_request.trigger_events[0].trigger_detail if decision_request.trigger_events else {},
+                        scope_market=decision_request.scope_market,
+                        round_num=1,
+                    )
+
+            # Run agent
             trade_feedback = ""
             decision = Decision(action="hold", reason="no decision")
             rounds = []
 
             for attempt in range(2):  # max 2 attempts (1 initial + 1 retry)
+                # Use the agent's run method with pre-built context
                 decision, rounds = self.agent.run(
-                    ts, snapshot, universe_str, stock_context, alerts, "",
+                    ts, snapshot, "", "", "", "",
                     trade_feedback=trade_feedback,
                     buy_quota_remaining=self.portfolio._constraints.daily_buys_remaining,
+                    pre_built_messages=messages,
                 )
                 all_rounds.extend(rounds)
 
-                # Log LLM call details
+                # Log LLM call details, agent rounds, and tool calls
                 for r in rounds:
                     prompt_t = getattr(r, '_prompt_tokens', 0)
                     compl_t = getattr(r, '_completion_tokens', 0)
@@ -223,6 +367,18 @@ class ExperimentRunner:
                         prompt_t, compl_t, r.latency_ms,
                         reasoning=reasoning, response=r.llm_response,
                     )
+                    # Log agent round
+                    self.logger.log_round(r, timestamp=ts)
+                    # Log tool calls (if any)
+                    tool_records = getattr(r, '_tool_records', [])
+                    for tr in tool_records:
+                        self.logger.log_tool_call(
+                            timestamp=ts,
+                            tool_name=tr["name"],
+                            tool_args=tr["args"],
+                            tool_result=tr["result"],
+                            latency_ms=tr["latency_ms"],
+                        )
 
                 # Execute trades and collect results
                 if decision.action == "trade":
@@ -237,7 +393,6 @@ class ExperimentRunner:
                             if result.success:
                                 executed_qty = result.order.quantity
                                 if executed_qty != requested_qty:
-                                    # Lot rounding adjusted the quantity
                                     feedback_results.append({
                                         "type": "adjusted",
                                         "symbol": trade.symbol,
@@ -280,13 +435,10 @@ class ExperimentRunner:
                     if not has_failures or attempt == 1:
                         break
 
-                    # Build feedback for retry (include OK/ADJUSTED/FAILED)
                     trade_feedback = ContextBuilder.build_trade_feedback(feedback_results)
-                    # Update snapshot for retry (portfolio state changed)
                     snapshot = self.portfolio.get_snapshot(ts)
                     snapshot.fx_rates = fx_rates
                 else:
-                    # Hold or other action, no retry needed
                     break
 
             # Log
@@ -294,13 +446,24 @@ class ExperimentRunner:
             self.logger.log_snapshot(self.portfolio.get_snapshot(ts))
             portfolio_history.append(self.portfolio.get_snapshot(ts))
 
-            decision_count += 1
-
-            # Calculate total LLM calls for this decision
+            # Calculate total LLM calls and latency for this decision
             calls_this_decision = len(rounds)
-
-            # Calculate total latency for this decision
             latency_ms = sum(r.latency_ms for r in rounds)
+
+            # Log decision event (v3)
+            execution_result = json.dumps({
+                "trades": [{"symbol": t.symbol, "side": t.side.value, "qty": t.quantity} for t in decision.trades],
+            }) if decision.trades else "{}"
+            self.logger.log_decision_event(
+                timestamp=ts,
+                decision_type=decision_request.decision_type.value,
+                raw_output=rounds[-1].llm_response if rounds else "",
+                parsed_output=json.dumps({"action": decision.action, "reason": decision.reason}),
+                execution_result=execution_result,
+                latency_ms=int(latency_ms),
+            )
+
+            decision_count += 1
 
             # Build trades string
             trades_str = ""
@@ -311,9 +474,16 @@ class ExperimentRunner:
                     trades_parts.append(f"{t.side.value.upper()} {t.symbol}{pct}")
                 trades_str = ", ".join(trades_parts)
 
+            # Record decision in memory
+            self.memory.record_decision(
+                decision_request.decision_type,
+                f"{decision.action}: {trades_str or 'hold'}",
+                ts,
+            )
+
             # Structured progress output
             print(
-                f"[{ts}] decision={decision_count}/{len(timestamps)} | "
+                f"[{ts}] {decision_request.decision_type.value} | "
                 f"calls={calls_this_decision} | latency={latency_ms/1000:.1f}s | "
                 f"action={decision.action} | trades={trades_str} | "
                 f"NAV=${self.portfolio.nav:,.0f}",
@@ -338,9 +508,15 @@ class ExperimentRunner:
         # Final snapshot
         final_snapshot = self.portfolio.get_snapshot(timestamps[-1] if timestamps else "")
 
-        # Compute results
-        if not portfolio_history:
+        # Append final snapshot to portfolio_history for accurate metrics
+        if portfolio_history:
+            # Only append if final snapshot is different from last in history
+            if portfolio_history[-1].timestamp != final_snapshot.timestamp:
+                portfolio_history.append(final_snapshot)
+        else:
             portfolio_history = [final_snapshot]
+
+        # Compute results
         trades = self.portfolio.trade_history
         metrics = self.metrics.compute(portfolio_history, trades)
         behavior = self.behavior.analyze(all_rounds, trades)
@@ -417,9 +593,33 @@ class ExperimentRunner:
 
     def _is_end_of_session(self, ts: str) -> bool:
         """Check if this is the last decision point before market close.
-        20:00 UTC = last US trading hour. Avoid impulsive end-of-day trades."""
+
+        Returns True at exact market close times:
+        - CN: 07:00 UTC
+        - HK: 08:00 UTC
+        - US: 21:00 UTC
+        """
         time_part = ts[11:16] if len(ts) >= 16 else ""
-        return time_part == "20:00"
+        return time_part in ("07:00", "08:00", "21:00")
+
+    def _generate_session_summary(self, market: Market, timestamp: str, snapshot: PortfolioSnapshot) -> None:
+        """Generate session summary for a closing market."""
+        from src.core.types import SessionSummary
+        summary = SessionSummary(
+            market=market.value,
+            session_date=timestamp[:10],
+            market_read=f"{market.value} session closed at {timestamp}",
+            model_actions=[],
+            open_positions=[
+                {"symbol": pos.symbol, "plan": ""}
+                for key, pos in snapshot.positions.items()
+                if pos.market == market
+            ],
+            risk_notes=[],
+            created_at=timestamp,
+        )
+        self.memory.save_session_summary(summary)
+        print(f"  Session summary: {market.value} closed at {timestamp}")
 
     def _build_stock_data(self, ts: str, all_bars: dict) -> str:
         """Build compact card format stock data."""

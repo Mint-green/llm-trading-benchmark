@@ -3,10 +3,12 @@ AgentRunner — manages multi-round decision flow with LLM.
 
 Flow per timestamp:
   Round 1: Receive full context
-  Rounds 2-7: Use tools (query_stock, market_overview, etc.)
-  Round 8: Mandatory decision (TRADE or HOLD)
+  Rounds 2-3: Use tools (function calling)
+  Round 4: Mandatory decision (JSON only)
 
-Integrates with mimo-v2.5 via OpenAI API protocol.
+Supports two modes:
+  1. Legacy mode: prompt-based tool calls (query action)
+  2. v3 mode: native function calling + pre-built messages
 """
 
 from __future__ import annotations
@@ -63,26 +65,84 @@ class AgentRunner(IAgentRunner):
         self, timestamp: str, snapshot: PortfolioSnapshot,
         market_data: str, stock_data: str, alerts: str, news: str,
         trade_feedback: str = "", buy_quota_remaining: int = -1,
+        pre_built_messages: list[dict] | None = None,
     ) -> tuple[Decision, list[AgentRound]]:
-        """Run agent loop. Returns final decision and round history."""
+        """Run agent loop. Returns final decision and round history.
+
+        Args:
+            pre_built_messages: If provided, use these messages instead of building from context.
+                               Used for v3-style prompts (full_decision, focused_position, etc.)
+        """
         rounds: list[AgentRound] = []
         tool_results = ""
         final_decision = Decision(action="hold", reason="max rounds reached")
+        use_tools = pre_built_messages is not None  # Enable function calling for v3 mode
 
         for round_num in range(1, self._config.max_agent_rounds + 1):
             start_time = time.time()
 
             # Build context
-            messages = self._context.build(
-                timestamp, snapshot, market_data, stock_data,
-                alerts, news, round_num, tool_results,
-                trade_feedback=trade_feedback,
-                buy_quota_remaining=buy_quota_remaining,
-            )
+            if pre_built_messages and round_num == 1:
+                messages = pre_built_messages
+            else:
+                messages = self._context.build(
+                    timestamp, snapshot, market_data, stock_data,
+                    alerts, news, round_num, tool_results,
+                    trade_feedback=trade_feedback,
+                    buy_quota_remaining=buy_quota_remaining,
+                )
 
-            # Call LLM
-            response_text, prompt_tokens, completion_tokens, reasoning = self._call_llm(messages)
+            # Call LLM (with or without tools)
+            if use_tools and round_num < self._config.max_agent_rounds:
+                response_text, tool_calls, prompt_tokens, completion_tokens, reasoning = self._call_llm_with_tools(messages)
+            else:
+                response_text, prompt_tokens, completion_tokens, reasoning = self._call_llm(messages)
+                tool_calls = None
+
             latency = (time.time() - start_time) * 1000
+
+            # Handle function calling response
+            if tool_calls:
+                # Execute tool calls
+                tool_results, tool_records = self._execute_tool_calls(tool_calls, timestamp)
+
+                # Add controller reminder based on round number
+                if round_num == 1:
+                    tool_results += "\n\n[SYSTEM] You have used 1 tool round. If no concrete trade or risk action is justified now, produce final JSON. Do not continue broad exploration."
+                elif round_num == 2:
+                    tool_results += "\n\n[SYSTEM] You have used 2 tool rounds. Further exploration is discouraged. Produce final JSON unless one specific required field is still missing."
+                elif round_num >= 3:
+                    tool_results += "\n\n[SYSTEM] Tool exploration budget exhausted. Final JSON only."
+
+                # Record round
+                decision = Decision(action="query", reason="tool calls")
+                round_data = AgentRound(
+                    round_num=round_num,
+                    decision=decision,
+                    tool_results=tool_results,
+                    llm_response=response_text or f"[{len(tool_calls)} tool calls]",
+                    latency_ms=latency,
+                    tokens_used=prompt_tokens + completion_tokens,
+                )
+                round_data._prompt_tokens = prompt_tokens
+                round_data._completion_tokens = completion_tokens
+                round_data._reasoning = reasoning
+                round_data._tool_records = tool_records  # Store for logging
+                rounds.append(round_data)
+
+                # Append tool results to messages for next round
+                if pre_built_messages:
+                    pre_built_messages = list(pre_built_messages)  # copy
+                    pre_built_messages.append({"role": "assistant", "content": response_text, "tool_calls": [
+                        {
+                            "id": tc.get("id", f"call_{i}"),
+                            "type": "function",
+                            "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
+                        }
+                        for i, tc in enumerate(tool_calls)
+                    ]})
+                    pre_built_messages.append({"role": "tool", "tool_call_id": "all", "content": tool_results})
+                continue
 
             # Parse response
             decision = self._parse_decision(response_text)
@@ -113,7 +173,7 @@ class AgentRunner(IAgentRunner):
                 break
 
             elif decision.action == "query" and round_num < self._config.max_agent_rounds:
-                # Execute queries
+                # Execute queries (legacy mode)
                 tool_results = self._execute_queries(decision.queries, timestamp)
                 continue
 
@@ -155,6 +215,101 @@ class AgentRunner(IAgentRunner):
                 print(f"  [LLM] Attempt {attempt+1} failed: {e}")
                 time.sleep(3)
         return "", 0, 0, ""
+
+    def _call_llm_with_tools(self, messages: list[dict]) -> tuple[str, list | None, int, int, str]:
+        """Call LLM with function calling support.
+
+        Returns:
+            (response_text, tool_calls_or_none, prompt_tokens, completion_tokens, reasoning)
+        """
+        extra = {}
+        if not self._config.thinking_enabled:
+            extra["extra_body"] = {"thinking": {"type": "disabled"}}
+
+        # Get tool schemas
+        tools = self._tools.get_tool_descriptions()
+
+        for attempt in range(3):
+            try:
+                resp = self._client.chat.completions.create(
+                    model=self._api_model,
+                    messages=messages,
+                    max_tokens=self._max_tokens,
+                    temperature=self._config.temperature,
+                    tools=tools,
+                    tool_choice="auto",
+                    **extra,
+                )
+                msg = resp.choices[0].message
+                content = msg.content or ""
+                reasoning = getattr(msg, "reasoning_content", None) or ""
+                usage = resp.usage
+                prompt_tokens = usage.prompt_tokens if usage else 0
+                completion_tokens = usage.completion_tokens if usage else 0
+
+                # Check for tool calls
+                if msg.tool_calls:
+                    tool_calls = []
+                    for tc in msg.tool_calls:
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError:
+                            args = {}
+                        tool_calls.append({
+                            "id": tc.id,
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": json.dumps(args),
+                            },
+                        })
+                    return content, tool_calls, prompt_tokens, completion_tokens, reasoning
+
+                # No tool calls — return content
+                return content, None, prompt_tokens, completion_tokens, reasoning
+
+            except Exception as e:
+                print(f"  [LLM] Attempt {attempt+1} failed: {e}")
+                time.sleep(3)
+
+        return "", None, 0, 0, ""
+
+    def _execute_tool_calls(self, tool_calls: list[dict], timestamp: str) -> tuple[str, list[dict]]:
+        """Execute tool calls and return formatted results + tool call records.
+
+        Returns:
+            (formatted_results, tool_call_records)
+            tool_call_records: list of {name, args, result, latency_ms}
+        """
+        lines = ["[TOOL_RESULT]"]
+        records = []
+        for tc in tool_calls:
+            func = tc.get("function", {})
+            name = func.get("name", "")
+            try:
+                args = json.loads(func.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                args = {}
+
+            start_time = time.time()
+            result = self._tools.execute_tool(name, args, timestamp)
+            latency = (time.time() - start_time) * 1000
+
+            records.append({
+                "name": name,
+                "args": args,
+                "result": result,
+                "latency_ms": latency,
+            })
+
+            # Format result
+            if len(result) < 120 and "\n" not in result:
+                lines.append(f"[{name}] {result}")
+            else:
+                lines.append(f"[{name}]")
+                for rline in result.split("\n"):
+                    lines.append(f"  {rline}")
+
+        return "\n".join(lines), records
 
     def _parse_decision(self, text: str) -> Decision:
         """Parse LLM output into Decision."""

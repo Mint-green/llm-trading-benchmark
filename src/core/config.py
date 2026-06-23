@@ -14,6 +14,68 @@ from .types import Market, MarketHours, PositionLimit
 
 
 @dataclass(frozen=True)
+class TriggerConfig:
+    """Trigger thresholds for plan monitoring. Market-specific overrides possible."""
+    price_move_pct: float = 0.02       # 2% price move triggers review
+    atr_move_multiple: float = 1.5     # 1.5x ATR move triggers review
+    pnl_pct_threshold: float = -0.025  # -2.5% PnL triggers stop review
+    trailing_drawdown_pct: float = 0.02  # 2% drawdown from peak
+    trailing_atr_multiple: float = 2.0   # 2x ATR from peak
+    bars_elapsed: int = 6              # review every 6 bars (30min at 5min/bar)
+
+
+@dataclass(frozen=True)
+class CryptoTriggerConfig:
+    """Crypto-specific trigger thresholds (wider due to higher volatility)."""
+    price_move_pct: float = 0.05       # 5%
+    pnl_pct_threshold: float = -0.05   # -5%
+    trailing_drawdown_pct: float = 0.03  # 3%
+
+
+@dataclass(frozen=True)
+class OpenWindowConfig:
+    """Decision frequency during market open window."""
+    enabled: bool = True
+    minutes_after_open: int = 30
+    interval_minutes: int = 15
+    include_open_plus_30: bool = True
+
+
+@dataclass(frozen=True)
+class CloseWindowConfig:
+    """Decision frequency during market close window."""
+    enabled: bool = True
+    minutes_before_close: int = 30
+    interval_minutes: int = 15
+    include_close_time: bool = False
+
+
+@dataclass(frozen=True)
+class DecisionScheduleConfig:
+    """Full decision scheduling configuration."""
+    normal_interval_minutes: int = 30
+    open_window: OpenWindowConfig = field(default_factory=OpenWindowConfig)
+    close_window: CloseWindowConfig = field(default_factory=CloseWindowConfig)
+
+
+@dataclass(frozen=True)
+class TailGuardConfig:
+    """Tail guard configuration for close window."""
+    enabled: bool = True
+    minutes_before_close: int = 15
+    block_new_buy: bool = True
+    block_increase_position: bool = True
+    allow_reduce_close_hold: bool = True
+
+
+@dataclass(frozen=True)
+class MarketCloseRuleConfig:
+    """Market close rule configuration."""
+    at_or_after_close_no_same_session_trade: bool = True
+    final_bar_usable_for_summary: bool = True
+
+
+@dataclass(frozen=True)
 class Config:
     """Benchmark configuration. Immutable after creation."""
 
@@ -70,6 +132,19 @@ class Config:
     # --- Agent ---
     max_agent_rounds: int = 4  # Round1=context, 2-3=tools, 4=mandatory decision
     max_decisions: int = 0     # 0 = unlimited
+
+    # --- Decision Schedule ---
+    decision_schedule: DecisionScheduleConfig = field(default_factory=DecisionScheduleConfig)
+    tail_guard: TailGuardConfig = field(default_factory=TailGuardConfig)
+    market_close_rule: MarketCloseRuleConfig = field(default_factory=MarketCloseRuleConfig)
+
+    # --- Trigger Thresholds ---
+    trigger_config: TriggerConfig = field(default_factory=TriggerConfig)
+    crypto_trigger_config: CryptoTriggerConfig = field(default_factory=CryptoTriggerConfig)
+
+    # --- Time System ---
+    benchmark_boundary_utc: str = "00:00"  # daily summary at 00:00 UTC
+    session_summary_minutes_after_close: int = 5  # session summary 5min after market close
 
     # --- Portfolio ---
     initial_cash: float = 100_000.0

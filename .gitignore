@@ -6,6 +6,9 @@ config/*.toml
 *.db
 output/
 
+# 本地备份
+bak/
+
 # Python
 __pycache__/
 *.pyc
