@@ -62,7 +62,7 @@ class AgentRunner(IAgentRunner):
     def run(
         self, timestamp: str, snapshot: PortfolioSnapshot,
         market_data: str, stock_data: str, alerts: str, news: str,
-        trade_feedback: str = "",
+        trade_feedback: str = "", buy_quota_remaining: int = -1,
     ) -> tuple[Decision, list[AgentRound]]:
         """Run agent loop. Returns final decision and round history."""
         rounds: list[AgentRound] = []
@@ -77,6 +77,7 @@ class AgentRunner(IAgentRunner):
                 timestamp, snapshot, market_data, stock_data,
                 alerts, news, round_num, tool_results,
                 trade_feedback=trade_feedback,
+                buy_quota_remaining=buy_quota_remaining,
             )
 
             # Call LLM

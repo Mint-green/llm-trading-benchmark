@@ -66,7 +66,7 @@ class ExperimentRunner:
         )
 
         # Agent layer
-        self.context_builder = ContextBuilder()
+        self.context_builder = ContextBuilder(max_rounds=self.config.max_agent_rounds)
         self.tool_system = ToolSystem(
             self.data_provider, self.features,
             lambda: self.portfolio.get_snapshot(""),
@@ -137,6 +137,7 @@ class ExperimentRunner:
         all_rounds: list[AgentRound] = []
         all_decisions: list[dict] = []
         decision_count = 0
+        portfolio_history: list[PortfolioSnapshot] = []  # collect snapshots for metrics
 
         fx_rates = dict(self.config.fx_rates)  # initial FX rates
 
@@ -146,6 +147,9 @@ class ExperimentRunner:
             if new_rates:
                 fx_rates = new_rates
                 self.nav_engine.update_rates(fx_rates)
+
+            # Reset per-decision state
+            self.portfolio._constraints.reset_decision_state(ts)
 
             # Update portfolio prices
             self._update_prices(ts, all_bars)
@@ -158,22 +162,40 @@ class ExperimentRunner:
             if not self._any_stock_market_open(ts):
                 continue
 
+            # Skip end-of-session (20:00 UTC = last US hour) to avoid impulsive closing trades
+            if self._is_end_of_session(ts):
+                if self._any_stock_market_open(ts):
+                    print(
+                        f"[{ts}] decision={decision_count+1}/{len(timestamps)} | "
+                        f"calls=0 | latency=0.0s | action=hold (end of session) | "
+                        f"trades= | NAV=${self.portfolio.nav:,.0f}",
+                        flush=True,
+                    )
+                continue
+
+            # Build alerts (position RSI extremes only — actionable signals)
+            alerts = self._build_alerts(ts, all_bars)
+
             # Get index returns
             index_returns = self.index_provider.get_all_index_returns(ts)
 
             # Build 3-layer context using screener
             held_tickers = {pos.symbol: pos.market for pos in snapshot.positions.values()}
             candidates = self.screener.screen(all_bars, ts, held_tickers=held_tickers)
-            universe_str = ContextBuilder.build_universe_layer(
-                {m: list(bars.keys()) for m, bars in all_bars.items()}
-            )
+
+            # Full universe list (restored per system-design.md Layer 1)
+            universe_dict = {
+                Market.US: self.universe.get_symbols(Market.US),
+                Market.HK: self.universe.get_symbols(Market.HK),
+                Market.CN: self.universe.get_symbols(Market.CN),
+                Market.CRYPTO: self.universe.get_symbols(Market.CRYPTO),
+            }
+            universe_str = ContextBuilder.build_universe_layer(universe_dict)
+
             market_summary = ContextBuilder.build_market_summary_from_universe(
                 all_bars, self.features, ts, index_returns=index_returns,
             )
             candidate_str, _ = ContextBuilder.build_candidate_layer(candidates, detail_count=0)
-            alerts = self._build_alerts(ts, all_bars)
-
-            # Combine: market summary + candidate table (no separate detail layer)
             stock_context = market_summary + "\n\n" + candidate_str
 
             # Run agent with retry mechanism
@@ -185,6 +207,7 @@ class ExperimentRunner:
                 decision, rounds = self.agent.run(
                     ts, snapshot, universe_str, stock_context, alerts, "",
                     trade_feedback=trade_feedback,
+                    buy_quota_remaining=self.portfolio._constraints.daily_buys_remaining,
                 )
                 all_rounds.extend(rounds)
 
@@ -267,6 +290,7 @@ class ExperimentRunner:
             # Log
             self.logger.log_decision(ts, decision, snapshot)
             self.logger.log_snapshot(self.portfolio.get_snapshot(ts))
+            portfolio_history.append(self.portfolio.get_snapshot(ts))
 
             decision_count += 1
 
@@ -313,7 +337,8 @@ class ExperimentRunner:
         final_snapshot = self.portfolio.get_snapshot(timestamps[-1] if timestamps else "")
 
         # Compute results
-        portfolio_history = [final_snapshot]  # simplified
+        if not portfolio_history:
+            portfolio_history = [final_snapshot]
         trades = self.portfolio.trade_history
         metrics = self.metrics.compute(portfolio_history, trades)
         behavior = self.behavior.analyze(all_rounds, trades)
@@ -373,12 +398,26 @@ class ExperimentRunner:
         return False
 
     def _any_stock_market_open(self, ts: str) -> bool:
-        """Check if any non-crypto market is open."""
+        """Check if any non-crypto market is open (respects trading days)."""
+        # Weekend check: stock markets closed Sat/Sun, crypto remains 24/7
+        from datetime import datetime
+        try:
+            dt = datetime.strptime(ts[:16], "%Y-%m-%d %H:%M")
+            if dt.weekday() >= 5:  # Saturday=5, Sunday=6
+                return False
+        except ValueError:
+            pass
         for market in [Market.US, Market.HK, Market.CN]:
             ok, _ = self.asset_status.get_status(market, "", ts)
             if ok:
                 return True
         return False
+
+    def _is_end_of_session(self, ts: str) -> bool:
+        """Check if this is the last decision point before market close.
+        20:00 UTC = last US trading hour. Avoid impulsive end-of-day trades."""
+        time_part = ts[11:16] if len(ts) >= 16 else ""
+        return time_part == "20:00"
 
     def _build_stock_data(self, ts: str, all_bars: dict) -> str:
         """Build compact card format stock data."""
@@ -402,18 +441,26 @@ class ExperimentRunner:
         return "\n".join(lines)
 
     def _build_alerts(self, ts: str, all_bars: dict) -> str:
-        """Generate alerts for extreme conditions."""
+        """Generate alerts for positions only — actionable RSI extremes.
+
+        Only checks currently held positions, not the full universe.
+        RSI extremes on stocks we don't own are noise, not signals.
+        """
         alerts = []
-        for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO]:
-            for sym, bars in all_bars.get(market, {}).items():
-                snap = self.features.compute(bars, ts)
-                if snap is None:
-                    continue
-                if snap.rsi > 80:
-                    alerts.append(f"ALERT: {sym} RSI={snap.rsi:.0f} OVERBOUGHT")
-                elif snap.rsi < 20:
-                    alerts.append(f"ALERT: {sym} RSI={snap.rsi:.0f} OVERSOLD")
-        return "\n".join(alerts[:10]) if alerts else "(no alerts)"
+        for key, pos in self.portfolio._positions.items():
+            if pos.quantity <= 0:
+                continue
+            bars = all_bars.get(pos.market, {}).get(pos.symbol, [])
+            if not bars:
+                continue
+            snap = self.features.compute(bars, ts)
+            if snap is None:
+                continue
+            if snap.rsi > 80:
+                alerts.append(f"ALERT: {pos.symbol} RSI={snap.rsi:.0f} OVERBOUGHT — consider taking profit")
+            elif snap.rsi < 20:
+                alerts.append(f"ALERT: {pos.symbol} RSI={snap.rsi:.0f} OVERSOLD — consider adding or holding")
+        return "\n".join(alerts[:5]) if alerts else "(no alerts)"
 
     def _build_market_overview(self, ts: str, all_bars: dict) -> str:
         lines = []

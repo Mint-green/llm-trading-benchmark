@@ -14,8 +14,60 @@ from src.core.config import Config
 class ConstraintEngine(IConstraintEngine):
     """Validates orders against portfolio constraints."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, cooling_hours: float = 2.0, max_daily_trades: int = 25):
         self._limits = config.position_limits
+        self._cooling_hours = cooling_hours
+        self._max_daily_trades = max_daily_trades
+        # Track last buy time per position: {key: timestamp_str}
+        self._last_buy: dict[str, str] = {}
+        # Track daily trade count: {date_str: count}
+        self._daily_trades: dict[str, int] = {}
+        # Track SELLs per decision point to prevent panic selling
+        self._sells_this_decision: int = 0
+        self._last_decision_ts: str = ""
+
+    def reset_decision_state(self, timestamp: str) -> None:
+        """Reset per-decision counters (call at start of each decision point)."""
+        if timestamp[:16] != self._last_decision_ts[:16]:
+            self._sells_this_decision = 0
+            self._last_decision_ts = timestamp
+
+    def record_buy(self, key: str, timestamp: str) -> None:
+        """Record a buy for cooling period tracking."""
+        self._last_buy[key] = timestamp
+
+    def record_trade(self, timestamp: str) -> None:
+        """Record a trade for daily limit tracking."""
+        date = timestamp[:10]
+        self._daily_trades[date] = self._daily_trades.get(date, 0) + 1
+
+    @property
+    def daily_buys_remaining(self) -> int:
+        """How many BUYs are left today (for LLM context)."""
+        today = max(self._daily_trades.keys(), default="")
+        used = self._daily_trades.get(today, 0)
+        return max(0, self._max_daily_trades - used)
+
+    def check_daily_limit(self, timestamp: str) -> tuple[bool, str]:
+        """Check if daily trade limit is exceeded."""
+        date = timestamp[:10]
+        count = self._daily_trades.get(date, 0)
+        if count >= self._max_daily_trades:
+            return False, (
+                f"daily trade limit reached ({count}/{self._max_daily_trades}). "
+                f"Wait for the next trading day."
+            )
+        return True, "ok"
+
+    def _hours_since(self, timestamp: str, reference: str) -> float:
+        """Calculate hours between two timestamp strings."""
+        from datetime import datetime
+        try:
+            t1 = datetime.strptime(timestamp[:16], "%Y-%m-%d %H:%M")
+            t2 = datetime.strptime(reference[:16], "%Y-%m-%d %H:%M")
+            return (t1 - t2).total_seconds() / 3600
+        except ValueError:
+            return 999  # can't parse, allow trade
 
     def validate_buy(
         self, symbol: str, market: Market, quantity: int, price: float,
@@ -83,6 +135,7 @@ class ConstraintEngine(IConstraintEngine):
     def validate_sell(
         self, key: str, quantity: int,
         current_positions: dict[str, Position],
+        timestamp: str = "",
     ) -> tuple[bool, str]:
         """Validate a sell order."""
         if quantity <= 0:
@@ -94,5 +147,19 @@ class ConstraintEngine(IConstraintEngine):
 
         if quantity > pos.quantity:
             return False, f"sell quantity {quantity} > held {pos.quantity}"
+
+        # Reject micro-sells: allocation_pct < 2% are cost-inefficient noise
+        if quantity <= 0:
+            return False, "sell quantity too small (allocation_pct < 2% — costs exceed benefit)"
+
+        # Cooling period: prevent selling within N hours of purchase
+        if key in self._last_buy and timestamp:
+            hours = self._hours_since(timestamp, self._last_buy[key])
+            if hours < self._cooling_hours:
+                return False, (
+                    f"cooling period: bought {hours:.1f}h ago, "
+                    f"must hold >= {self._cooling_hours:.0f}h. "
+                    f"Short-term flipping is proven to lose money after costs."
+                )
 
         return True, "ok"

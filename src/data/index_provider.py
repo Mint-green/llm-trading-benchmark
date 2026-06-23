@@ -18,7 +18,7 @@ from src.core.types import Market
 # ============================================================
 
 # getStockData 项目根目录
-STOCK_DATA_ROOT = "D:/Projects/claw/getStockData"
+STOCK_DATA_ROOT = os.environ.get("STOCK_DATA_ROOT", os.path.expanduser("~/Desktop/getStockData"))
 
 # 数据库路径
 FOREX_DB_PATH = os.path.join(STOCK_DATA_ROOT, "data", "FOREX_stock.db")

@@ -199,15 +199,36 @@ class PortfolioEngine(IPortfolioEngine):
         self, order: TradeOrder, price: float, timestamp: str,
     ) -> TradeResult:
         """Full order processing pipeline: rules → constraints → FX → execution → settlement."""
+        result = None
 
-        # 1. Market rules check
+        # 1. Sell limit per decision (max 2 SELLs to prevent panic selling)
+        if order.side == OrderSide.SELL:
+            if self._constraints._sells_this_decision >= 2:
+                result = TradeResult(
+                    order=order, success=False,
+                    error="limit: max 2 SELLs per decision (prevent panic selling). Sell gradually across decisions."
+                )
+                self._trade_history.append(result)
+                return result
+            self._constraints._sells_this_decision += 1
+
+        # 2. Daily trade limit (only BUYs count toward limit; SELLs always allowed)
+        ok, reason = self._constraints.check_daily_limit(timestamp)
+        if not ok:
+            result = TradeResult(order=order, success=False, error=f"limit: {reason}")
+            self._trade_history.append(result)
+            return result
+
+        # 2. Market rules check
         can_trade, rule_reason = self._market_rules.can_trade(
             order.market, order.symbol, order.side, timestamp,
         )
         if not can_trade:
-            return TradeResult(order=order, success=False, error=f"market_rule: {rule_reason}")
+            result = TradeResult(order=order, success=False, error=f"market_rule: {rule_reason}")
+            self._trade_history.append(result)
+            return result
 
-        # 2. Constraint check (price in USD) — BEFORE FX conversion
+        # 3. Constraint check (price in USD) — BEFORE FX conversion
         price_usd = self._to_usd(price, order.market)
         if order.side == OrderSide.BUY:
             ok, reason = self._constraints.validate_buy(
@@ -215,43 +236,57 @@ class PortfolioEngine(IPortfolioEngine):
                 self.nav, self._positions,
             )
             if not ok:
-                return TradeResult(order=order, success=False, error=f"constraint: {reason}")
+                result = TradeResult(order=order, success=False, error=f"constraint: {reason}")
+                self._trade_history.append(result)
+                return result
         else:
             key = f"{order.market.value}:{order.symbol}"
             sellable = self._settlement.get_sellable_quantity(key, timestamp)
             if order.quantity > sellable:
-                return TradeResult(
+                result = TradeResult(
                     order=order, success=False,
                     error=f"T+1: can only sell {sellable} of {order.quantity}",
                 )
+                self._trade_history.append(result)
+                return result
             ok, reason = self._constraints.validate_sell(
-                key, order.quantity, self._positions,
+                key, order.quantity, self._positions, timestamp=timestamp,
             )
             if not ok:
-                return TradeResult(order=order, success=False, error=f"constraint: {reason}")
+                result = TradeResult(order=order, success=False, error=f"constraint: {reason}")
+                self._trade_history.append(result)
+                return result
 
-        # 3. Ensure local currency funds (for buys) — AFTER constraint check
+        # 4. Ensure local currency funds (for buys) — AFTER constraint check
         currency = MARKET_CURRENCY.get(order.market, "USD")
         if order.side == OrderSide.BUY:
             cost_estimate = price * order.quantity * 1.002  # rough fee estimate
             if not self.ensure_cash(currency, cost_estimate, timestamp):
-                return TradeResult(order=order, success=False, error=f"insufficient {currency} funds")
+                result = TradeResult(order=order, success=False, error=f"insufficient {currency} funds")
+                self._trade_history.append(result)
+                return result
 
-        # 4. Execution
+        # 5. Execution
         result = self._execution.execute(order, price, timestamp)
         if not result.success:
+            self._trade_history.append(result)
             return result
 
-        # 5. Update portfolio (in local currency) — use rounded quantity from execution
+        # 6. Update portfolio (in local currency) — use rounded quantity from execution
         if order.side == OrderSide.BUY:
             self.execute_buy(order.symbol, order.market, result.order.quantity, result.price, result.fees)
+            # Record buy time for cooling period
+            key = f"{order.market.value}:{order.symbol}"
+            self._constraints.record_buy(key, timestamp)
+            # Record trade for daily limit (only BUYs count; SELLs always allowed)
+            self._constraints.record_trade(timestamp)
         else:
             self.execute_sell(order.symbol, order.market, result.order.quantity, result.price, result.fees)
 
-        # 6. Settlement
+        # 7. Settlement
         self._settlement.settle(result, timestamp)
 
-        # 7. Record
+        # 8. Record
         self._trade_history.append(result)
         return result
 

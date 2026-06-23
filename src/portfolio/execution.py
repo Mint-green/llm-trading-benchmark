@@ -20,7 +20,7 @@ from ..portfolio.nav import NavEngine
 
 
 # Load lot sizes from getStockData
-_STOCKDATA_DIR = "D:/Projects/claw/getStockData"
+_STOCKDATA_DIR = os.environ.get("STOCK_DATA_ROOT", os.path.expanduser("~/Desktop/getStockData"))
 _get_lot_size = None
 HK_LOT_SIZES: dict[str, int] = {}
 DEFAULT_HK_LOT = 100
