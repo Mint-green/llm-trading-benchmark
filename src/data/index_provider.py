@@ -56,15 +56,18 @@ CRYPTO_INDEX_NAME = "BTC"
 class IndexProvider:
     """Provides index/ETF price data for market summary."""
 
-    def __init__(self):
+    def __init__(self, data_dir: str | None = None):
         self._conns: dict[str, sqlite3.Connection] = {}
+        self._data_dir = data_dir or os.path.join(STOCK_DATA_ROOT, "data")
 
     def _get_conn(self, source: str) -> sqlite3.Connection:
         if source not in self._conns:
             if source == "forex_db":
-                self._conns[source] = sqlite3.connect(f"file:{FOREX_DB_PATH}?mode=ro", uri=True)
+                path = os.path.join(self._data_dir, "FOREX_stock.db")
+                self._conns[source] = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
             elif source == "a_stock_db":
-                self._conns[source] = sqlite3.connect(f"file:{A_STOCK_DB_PATH}?mode=ro", uri=True)
+                path = os.path.join(self._data_dir, "A_stock.db")
+                self._conns[source] = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         return self._conns[source]
 
     def close(self) -> None:

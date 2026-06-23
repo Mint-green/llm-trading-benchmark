@@ -5,6 +5,7 @@ Wires all modules together and runs the backtest loop.
 """
 
 from __future__ import annotations
+import os
 import time
 from typing import Any
 
@@ -51,8 +52,9 @@ class ExperimentRunner:
         self.features = FeatureGenerator()
         self.asset_status = AssetStatusProvider(self.config)
         self.screener = Screener(self.features)
-        self.fx_provider = FxProvider()
-        self.index_provider = IndexProvider()
+        forex_db = os.path.join(self.config.stock_data_dir, "FOREX_stock.db")
+        self.fx_provider = FxProvider(db_path=forex_db)
+        self.index_provider = IndexProvider(data_dir=self.config.stock_data_dir)
 
         # Portfolio layer
         self.nav_engine = NavEngine(self.config.fx_rates)

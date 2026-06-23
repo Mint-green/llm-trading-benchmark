@@ -46,12 +46,13 @@ DEFAULT_RATES = {
 class FxProvider:
     """Provides FX rates from historical 5min data."""
 
-    def __init__(self):
+    def __init__(self, db_path: str | None = None):
         self._conn: sqlite3.Connection | None = None
+        self._db_path = db_path or FOREX_DB_PATH
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(f"file:{FOREX_DB_PATH}?mode=ro", uri=True)
+            self._conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True)
         return self._conn
 
     def close(self) -> None:
