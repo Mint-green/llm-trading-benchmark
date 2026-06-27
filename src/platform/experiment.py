@@ -163,85 +163,163 @@ class ExperimentRunner:
         decision_count = 0
         portfolio_history: list[PortfolioSnapshot] = []  # collect snapshots for metrics
 
+        # Daily summary tracking
+        daily_start_nav = self.config.initial_cash
+        daily_decisions: list[dict] = []
+        daily_session_summaries: list = []
+        last_daily_summary_date = ""
+
         fx_rates = dict(self.config.fx_rates)  # initial FX rates
 
+        # Timing accumulators
+        _t_fx = _t_reset = _t_prices = _t_snap = _t_markets = _t_sched = _t_event = _t_ctx = _t_llm = _t_log = 0.0
+
         for i, ts in enumerate(timestamps):
+            import time as _time
+
             # Update FX rates at this timestamp
+            _t0 = _time.time()
             new_rates = self.fx_provider.get_all_rates(ts)
             if new_rates:
                 fx_rates = new_rates
                 self.nav_engine.update_rates(fx_rates)
+            _t_fx += _time.time() - _t0
 
             # Reset per-decision state
+            _t0 = _time.time()
             self.portfolio._constraints.reset_decision_state(ts)
+            _t_reset += _time.time() - _t0
 
             # Update portfolio prices
+            _t0 = _time.time()
             self._update_prices(ts, all_bars)
+            _t_prices += _time.time() - _t0
 
             # Snapshot (with real FX rates)
+            _t0 = _time.time()
             snapshot = self.portfolio.get_snapshot(ts)
             snapshot.fx_rates = fx_rates
+            _t_snap += _time.time() - _t0
 
             # Get open/closed markets
+            _t0 = _time.time()
             open_markets = self.scheduler.get_open_markets(ts)
             closed_markets = self.scheduler.get_closed_markets(ts)
+            _t_markets += _time.time() - _t0
 
-            # Skip crypto-only periods (no stock markets open, not weekend)
-            if not self._any_stock_market_open(ts):
+            # Daily summary at 00:05 UTC (before any market logic)
+            from datetime import datetime as _dt
+            time_part = ts[11:16] if len(ts) >= 16 else ""
+            if time_part == "00:05" and daily_decisions:
+                from src.evaluation.summary_engine import SummaryEngine
+                from datetime import timedelta as _td
+                summary_date = ts[:10]
+                prev_date = (_dt.strptime(summary_date, "%Y-%m-%d") - _td(days=1)).strftime("%Y-%m-%d")
+                engine = SummaryEngine()
+                nav_end = self.portfolio.nav
+                daily_summary = engine.generate_daily_summary(
+                    date=prev_date,
+                    nav_start=daily_start_nav,
+                    nav_end=nav_end,
+                    all_decisions=daily_decisions,
+                    all_trades=list(self.portfolio.trade_history),
+                    session_summaries=daily_session_summaries,
+                    snapshot=snapshot,
+                    plans=[],
+                )
+                self.memory.save_daily_summary(daily_summary)
+                print(f"  Daily summary: {prev_date} | return={daily_summary.daily_return_pct:+.2%} | NAV=${nav_end:,.0f}")
+                daily_start_nav = nav_end
+                daily_decisions = []
+                daily_session_summaries = []
+                last_daily_summary_date = summary_date
+
+            # Skip weekends (stock markets closed)
+            try:
+                _d = _dt.strptime(ts[:16], "%Y-%m-%d %H:%M")
+                if _d.weekday() >= 5:
+                    continue
+            except ValueError:
                 continue
 
-            # Detect events
+            # Session summary at market close + 5min (after weekend skip)
+            just_closed = self._just_closed_market(ts)
+            if just_closed:
+                summary = self._generate_session_summary(just_closed, ts, snapshot)
+                if summary:
+                    daily_session_summaries.append(summary)
+
+            # --- Decision scheduling ---
+            _t0 = _time.time()
             plans = self.memory.get_all_plans()
-            trigger_events, market_events, risk_events = self.event_detector.detect(
-                ts, snapshot, all_bars, plans, open_markets, closed_markets, self._risk_mode,
-            )
 
-            # Update plan peaks
-            for symbol, plan in plans.items():
-                pos = None
-                for key, p in snapshot.positions.items():
-                    if p.symbol == symbol:
-                        pos = p
-                        break
-                if pos:
-                    self.memory.update_plan_peak(symbol, pos.current_price)
+            # Quick scheduler pre-check (no state update, no event detection)
+            has_stock_market = any(m in open_markets for m in [Market.US, Market.HK, Market.CN])
+            might_need_decision = has_stock_market and self.scheduler.needs_decision(ts, open_markets)
+            _t_sched += _time.time() - _t0
 
-            # Expire memory items
+            # AUTO_HOLD fast path — timestamp doesn't need a decision
+            if not might_need_decision:
+                # If no plans exist, no triggers possible — skip entirely
+                if not plans:
+                    self.logger.log_snapshot(snapshot)
+                    portfolio_history.append(snapshot)
+                    if i % 12 == 0:
+                        print(f"[{ts}] auto_hold | NAV=${self.portfolio.nav:,.0f}", flush=True)
+                    continue
+
+                # Check plan triggers only (lightweight, no volatility spike)
+                _t0 = _time.time()
+                trigger_events, _, _ = self.event_detector.detect(
+                    ts, snapshot, all_bars, plans, open_markets, closed_markets, self._risk_mode,
+                    lightweight=True,
+                )
+                _t_event += _time.time() - _t0
+                decision_request = self.scheduler.schedule(
+                    ts, open_markets, closed_markets, trigger_events, self._risk_mode,
+                )
+                if decision_request.decision_type == DecisionType.AUTO_HOLD:
+                    # Still AUTO_HOLD after trigger check — skip
+                    self._update_plan_peaks(plans, snapshot)
+                    self.memory.expire_thesis(ts)
+                    self.memory.expire_watchlist(ts)
+                    self.memory.expire_avoid(ts)
+                    self.logger.log_snapshot(snapshot)
+                    portfolio_history.append(snapshot)
+                    if i % 12 == 0:
+                        print(f"[{ts}] auto_hold | NAV=${self.portfolio.nav:,.0f}", flush=True)
+                    continue
+                # else: trigger event found — fall through to full processing
+
+            else:
+                # Non-AUTO_HOLD from pre-check: run full event detection
+                _t0 = _time.time()
+                trigger_events, market_events, risk_events = self.event_detector.detect(
+                    ts, snapshot, all_bars, plans, open_markets, closed_markets, self._risk_mode,
+                    lightweight=True,
+                )
+                _t_event += _time.time() - _t0
+                decision_request = self.scheduler.schedule(
+                    ts, open_markets, closed_markets, trigger_events, self._risk_mode,
+                )
+
+            # --- Common processing for non-AUTO_HOLD ---
+            self._update_plan_peaks(plans, snapshot)
             self.memory.expire_thesis(ts)
             self.memory.expire_watchlist(ts)
             self.memory.expire_avoid(ts)
 
-            # Schedule decision
-            decision_request = self.scheduler.schedule(
-                ts, open_markets, closed_markets, trigger_events, self._risk_mode,
-            )
-
-            # Set tail guard state
             self.portfolio._constraints.set_tail_guard(
                 decision_request.tail_guard_active,
                 decision_request.tail_guard_markets,
             )
 
-            # Handle auto_hold (no LLM call)
+            # Final AUTO_HOLD check (in case scheduler changed decision)
             if decision_request.decision_type == DecisionType.AUTO_HOLD:
-                # Still log snapshot
                 self.logger.log_snapshot(snapshot)
                 portfolio_history.append(snapshot)
-
-                # Print progress (less verbose for auto_hold)
-                if i % 12 == 0:  # print every ~60min
-                    print(
-                        f"[{ts}] auto_hold | NAV=${self.portfolio.nav:,.0f}",
-                        flush=True,
-                    )
-                continue
-
-            # Handle end-of-session (last bar at market close)
-            if self._is_end_of_session(ts):
-                # Generate session summary for closing market
-                for market in closed_markets:
-                    if market != Market.CRYPTO:
-                        self._generate_session_summary(market, ts, snapshot)
+                if i % 12 == 0:
+                    print(f"[{ts}] auto_hold | NAV=${self.portfolio.nav:,.0f}", flush=True)
                 continue
 
             # Build alerts (position RSI extremes only — actionable signals)
@@ -251,6 +329,7 @@ class ExperimentRunner:
             index_returns = self.index_provider.get_all_index_returns(ts)
 
             # Build context based on decision type
+            _t_ctx_start = _time.time()
             if decision_request.decision_type == DecisionType.FULL_DECISION:
                 # Use v3-style bucketed context
                 held_info = {}
@@ -342,6 +421,8 @@ class ExperimentRunner:
                         round_num=1,
                     )
 
+            _t_ctx = _time.time() - _t_ctx_start
+
             # Run agent
             trade_feedback = ""
             decision = Decision(action="hold", reason="no decision")
@@ -349,12 +430,14 @@ class ExperimentRunner:
 
             for attempt in range(2):  # max 2 attempts (1 initial + 1 retry)
                 # Use the agent's run method with pre-built context
+                _t_llm_start = _time.time()
                 decision, rounds = self.agent.run(
                     ts, snapshot, "", "", "", "",
                     trade_feedback=trade_feedback,
                     buy_quota_remaining=self.portfolio._constraints.daily_buys_remaining,
                     pre_built_messages=messages,
                 )
+                _t_llm += _time.time() - _t_llm_start
                 all_rounds.extend(rounds)
 
                 # Log LLM call details, agent rounds, and tool calls
@@ -474,6 +557,16 @@ class ExperimentRunner:
                     trades_parts.append(f"{t.side.value.upper()} {t.symbol}{pct}")
                 trades_str = ", ".join(trades_parts)
 
+            # Collect decision records
+            decision_record = {
+                "timestamp": ts,
+                "action": decision.action,
+                "symbol": trades_str or "hold",
+                "market": decision_request.scope_market,
+            }
+            all_decisions.append(decision_record)
+            daily_decisions.append(decision_record)
+
             # Record decision in memory
             self.memory.record_decision(
                 decision_request.decision_type,
@@ -504,6 +597,38 @@ class ExperimentRunner:
             if self.config.max_decisions > 0 and decision_count >= self.config.max_decisions:
                 print(f"  Reached max decisions ({self.config.max_decisions})")
                 break
+
+        # Daily summary for the last day (if not already generated at 00:05)
+        if daily_decisions:
+            from src.evaluation.summary_engine import SummaryEngine
+            last_date = timestamps[-1][:10] if timestamps else ""
+            engine = SummaryEngine()
+            nav_end = self.portfolio.nav
+            daily_summary = engine.generate_daily_summary(
+                date=last_date,
+                nav_start=daily_start_nav,
+                nav_end=nav_end,
+                all_decisions=daily_decisions,
+                all_trades=list(self.portfolio.trade_history),
+                session_summaries=daily_session_summaries,
+                snapshot=self.portfolio.get_snapshot(timestamps[-1] if timestamps else ""),
+                plans=[],
+            )
+            self.memory.save_daily_summary(daily_summary)
+            print(f"  Daily summary (final): {last_date} | return={daily_summary.daily_return_pct:+.2%} | NAV=${nav_end:,.0f}")
+
+        # Timing summary
+        n_ts = len(timestamps)
+        n_dec = decision_count
+        print(f"\n=== Timing Breakdown ({n_ts} timestamps, {n_dec} decisions) ===")
+        print(f"  FX rates:     {_t_fx:.1f}s ({_t_fx/n_ts*1000:.1f}ms/ts)")
+        print(f"  Snapshot:     {_t_snap:.1f}s ({_t_snap/n_ts*1000:.1f}ms/ts)")
+        print(f"  Scheduler:    {_t_sched:.1f}s ({_t_sched/n_ts*1000:.1f}ms/ts)")
+        if n_dec > 0:
+            print(f"  Context:      {_t_ctx:.1f}s ({_t_ctx/n_dec:.1f}s/decision)")
+            print(f"  LLM calls:    {_t_llm:.1f}s ({_t_llm/n_dec:.1f}s/decision)")
+        _t_total = _t_fx + _t_snap + _t_sched + _t_ctx + _t_llm
+        print(f"  TOTAL:        {_t_total:.1f}s ({_t_total/60:.1f}min)")
 
         # Final snapshot
         final_snapshot = self.portfolio.get_snapshot(timestamps[-1] if timestamps else "")
@@ -592,18 +717,17 @@ class ExperimentRunner:
         return False
 
     def _is_end_of_session(self, ts: str) -> bool:
-        """Check if this is the last decision point before market close.
+        """Check if this is the session summary trigger point."""
+        return self._just_closed_market(ts) is not None
 
-        Returns True at exact market close times:
-        - CN: 07:00 UTC
-        - HK: 08:00 UTC
-        - US: 21:00 UTC
-        """
+    def _just_closed_market(self, ts: str) -> Market | None:
+        """Return the market that just closed (5min ago), or None."""
         time_part = ts[11:16] if len(ts) >= 16 else ""
-        return time_part in ("07:00", "08:00", "21:00")
+        close_map = {"07:05": Market.CN, "08:05": Market.HK, "21:05": Market.US}
+        return close_map.get(time_part)
 
-    def _generate_session_summary(self, market: Market, timestamp: str, snapshot: PortfolioSnapshot) -> None:
-        """Generate session summary for a closing market."""
+    def _generate_session_summary(self, market: Market, timestamp: str, snapshot: PortfolioSnapshot):
+        """Generate session summary for a closing market. Returns the summary."""
         from src.core.types import SessionSummary
         summary = SessionSummary(
             market=market.value,
@@ -620,6 +744,7 @@ class ExperimentRunner:
         )
         self.memory.save_session_summary(summary)
         print(f"  Session summary: {market.value} closed at {timestamp}")
+        return summary
 
     def _build_stock_data(self, ts: str, all_bars: dict) -> str:
         """Build compact card format stock data."""
@@ -670,6 +795,14 @@ class ExperimentRunner:
             n = len(all_bars.get(market, {}))
             lines.append(f"{market.value}: {n} stocks")
         return "\n".join(lines)
+
+    def _update_plan_peaks(self, plans: dict, snapshot) -> None:
+        """Update plan peak prices for trailing stop tracking."""
+        for symbol, plan in plans.items():
+            for key, p in snapshot.positions.items():
+                if p.symbol == symbol:
+                    self.memory.update_plan_peak(symbol, p.current_price)
+                    break
 
     def _update_prices(self, ts: str, all_bars: dict) -> None:
         """Update portfolio position prices."""

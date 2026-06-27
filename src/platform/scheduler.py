@@ -63,6 +63,12 @@ class DecisionScheduler:
         Market.US: "14:30",
     }
 
+    # Lunch break times (UTC HH:MM) — market closed during these windows
+    LUNCH_BREAK = {
+        Market.CN: ("03:30", "05:00"),  # 11:30-13:00 Beijing time
+        Market.HK: ("04:00", "05:00"),  # 12:00-13:00 Hong Kong time
+    }
+
     def __init__(self, config: Config):
         self._config = config
         self._schedule = config.decision_schedule
@@ -73,15 +79,34 @@ class DecisionScheduler:
         self._last_market_decision: dict[str, str] = {}  # market -> timestamp
         self._last_focused: dict[str, str] = {}  # symbol -> timestamp
 
-        # Track which markets have had their close-window decisions
-        self._close_window_done: dict[str, bool] = {}  # market -> done
-
     def reset(self) -> None:
         """Reset state for a new benchmark day."""
         self._last_full_decision = ""
         self._last_market_decision = {}
         self._last_focused = {}
-        self._close_window_done = {}
+
+    def needs_decision(self, timestamp: str, open_markets: list[Market]) -> bool:
+        """Quick check if this timestamp likely needs a decision (no state update).
+
+        Returns True if the timestamp is at a decision boundary (open/close window,
+        normal interval). Returns False for obvious AUTO_HOLD timestamps.
+        Does NOT update _last_full_decision — safe for pre-checking.
+        """
+        time_part = timestamp[11:16] if len(timestamp) >= 16 else ""
+
+        # Check open/close windows (always need decisions)
+        for market in open_markets:
+            if self._in_open_window(time_part, market):
+                return True
+            if self._in_close_window(time_part, market):
+                return True
+
+        # Check normal interval boundary
+        if self._is_normal_decision_time(time_part):
+            if not self._last_full_decision or self._minutes_since(timestamp, self._last_full_decision) >= 30:
+                return True
+
+        return False
 
     def schedule(
         self,
@@ -130,16 +155,14 @@ class DecisionScheduler:
         # Priority 2: Close window decisions (30min before close, every 15min)
         for market in open_markets:
             if self._in_close_window(time_part, market):
-                if not self._close_window_done.get(market.value, False):
-                    self._close_window_done[market.value] = True
-                    return DecisionRequest(
-                        timestamp=timestamp,
-                        decision_type=DecisionType.FULL_DECISION,
-                        priority="P2",
-                        scope_market=market.value,
-                        tail_guard_active=tail_guard_active,
-                        tail_guard_markets=tail_guard_markets,
-                    )
+                return DecisionRequest(
+                    timestamp=timestamp,
+                    decision_type=DecisionType.FULL_DECISION,
+                    priority="P2",
+                    scope_market=market.value,
+                    tail_guard_active=tail_guard_active,
+                    tail_guard_markets=tail_guard_markets,
+                )
 
         # Priority 2: Open window decisions (30min after open, every 15min)
         for market in open_markets:
@@ -156,7 +179,7 @@ class DecisionScheduler:
         # Priority 3: Normal full decision (every 30min)
         if self._is_normal_decision_time(time_part):
             # Check if we already did a full decision recently
-            if not self._last_full_decision or self._minutes_since(timestamp, self._last_full_decision) >= 25:
+            if not self._last_full_decision or self._minutes_since(timestamp, self._last_full_decision) >= 30:
                 self._last_full_decision = timestamp
                 return DecisionRequest(
                     timestamp=timestamp,
@@ -300,6 +323,19 @@ class DecisionScheduler:
         except ValueError:
             return False
 
+    def _in_lunch_break(self, time_part: str, market: Market) -> bool:
+        """Check if market is in lunch break at this time."""
+        lunch = self.LUNCH_BREAK.get(market)
+        if not lunch:
+            return False
+        try:
+            lunch_start = datetime.strptime(lunch[0], "%H:%M")
+            lunch_end = datetime.strptime(lunch[1], "%H:%M")
+            current = datetime.strptime(time_part, "%H:%M")
+            return lunch_start <= current < lunch_end
+        except ValueError:
+            return False
+
     def get_open_markets(self, timestamp: str) -> list[Market]:
         """Get list of open markets at this timestamp."""
         time_part = timestamp[11:16] if len(timestamp) >= 16 else ""
@@ -318,7 +354,8 @@ class DecisionScheduler:
                 if not close_time:
                     continue
                 if open_time <= time_part < close_time:
-                    open_markets.append(market)
+                    if not self._in_lunch_break(time_part, market):
+                        open_markets.append(market)
 
         # Crypto always open
         open_markets.append(Market.CRYPTO)

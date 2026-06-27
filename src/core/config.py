@@ -125,7 +125,7 @@ class Config:
     # --- Benchmark parameters ---
     backtest_start: str = "2026-02-03"
     backtest_end: str = "2026-02-09"
-    decision_interval: int = 60  # minutes between decisions
+    decision_interval: int = 5   # minutes between decisions
     snapshot_interval: int = 60  # minutes between portfolio snapshots
     dataset_version: str = "2026-06-05"
 
@@ -259,7 +259,7 @@ class Config:
             # Backtest
             "backtest_start": backtest_cfg.get("start", "2026-02-03"),
             "backtest_end": backtest_cfg.get("end", "2026-02-09"),
-            "decision_interval": backtest_cfg.get("interval", 60),
+            "decision_interval": backtest_cfg.get("decision_interval", 5),
             "max_decisions": backtest_cfg.get("max_decisions", 0),
             # Model
             "temperature": model_cfg.get("temperature", 0.3),

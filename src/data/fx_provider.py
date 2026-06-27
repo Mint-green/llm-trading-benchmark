@@ -49,6 +49,7 @@ class FxProvider:
     def __init__(self, db_path: str | None = None):
         self._conn: sqlite3.Connection | None = None
         self._db_path = db_path or FOREX_DB_PATH
+        self._cache: dict[str, dict[str, float]] = {}  # timestamp -> {currency: rate}
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -89,6 +90,11 @@ class FxProvider:
 
     def get_all_rates(self, timestamp: str = "") -> dict[str, float]:
         """Get all USD-based rates at a timestamp. Returns {currency: rate_per_usd}."""
+        # Cache by hour (FX rates don't change within an hour for backtest)
+        cache_key = timestamp[:13] if len(timestamp) >= 13 else timestamp
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
         rates = {"USD": 1.0}
         for currency in ["HKD", "CNY", "JPY", "EUR", "GBP"]:
             rate = self.get_rate("USD", currency, timestamp)
@@ -96,6 +102,8 @@ class FxProvider:
                 rates[currency] = rate
             else:
                 rates[currency] = DEFAULT_RATES.get(currency, 1.0)
+
+        self._cache[cache_key] = rates
         return rates
 
     def _get_rate_from_db(self, pair: str, timestamp: str) -> float | None:

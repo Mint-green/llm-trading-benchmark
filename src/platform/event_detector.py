@@ -70,8 +70,13 @@ class EventDetector:
         open_markets: list[Market],
         closed_markets: list[Market],
         risk_mode: RiskMode = RiskMode.GREEN,
+        lightweight: bool = False,
     ) -> tuple[list[TriggerEvent], list[MarketEvent], list[RiskEvent]]:
         """Detect all events at this timestamp.
+
+        Args:
+            lightweight: if True, skip expensive volatility spike detection
+                (used for AUTO_HOLD pre-check to save ~0.2s per timestamp)
 
         Returns:
             (trigger_events, market_events, risk_events)
@@ -80,20 +85,37 @@ class EventDetector:
         market_events: list[MarketEvent] = []
         risk_events: list[RiskEvent] = []
 
-        # 1. Detect market events
-        market_events.extend(self._detect_market_events(timestamp, open_markets, closed_markets, all_bars))
+        # 1. Detect market events (skip volatility spike in lightweight mode)
+        if lightweight:
+            # Only detect open/close transitions (cheap)
+            for market in open_markets:
+                was_open = self._prev_open_state.get(market.value, True)
+                if not was_open:
+                    market_events.append(MarketEvent(
+                        event_type="market_open", market=market, priority="P3",
+                        detail={"timestamp": timestamp},
+                    ))
+                self._prev_open_state[market.value] = True
+            for market in closed_markets:
+                was_open = self._prev_open_state.get(market.value, True)
+                if was_open:
+                    market_events.append(MarketEvent(
+                        event_type="market_close", market=market, priority="P3",
+                        detail={"timestamp": timestamp},
+                    ))
+                self._prev_open_state[market.value] = False
+        else:
+            market_events.extend(self._detect_market_events(timestamp, open_markets, closed_markets, all_bars))
 
-        # 2. Detect risk events
+        # 2. Detect risk events (cheap, always run)
         risk_events.extend(self._detect_risk_events(snapshot, risk_mode))
 
-        # 3. Detect plan trigger events
+        # 3. Detect plan trigger events (only if plans exist)
         for symbol, plan in plans.items():
             events = self._evaluate_plan_triggers(
                 plan, symbol, snapshot, all_bars, risk_mode,
             )
             trigger_events.extend(events)
-
-        # 4. Detect memory events (watchlist/avoid expiry) — handled by MemoryManager
 
         return trigger_events, market_events, risk_events
 

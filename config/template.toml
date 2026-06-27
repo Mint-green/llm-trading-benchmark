@@ -8,7 +8,7 @@ base_dir = ""
 [backtest]
 start = "2026-02-03"
 end = "2026-02-09"
-decision_interval = 60  # 分钟
+decision_interval = 5   # 分钟
 max_decisions = 0       # 0=不限制
 
 [model]
