@@ -88,8 +88,8 @@ class MetricsEngine(IMetricsEngine):
         pnl_by_market = self._compute_pnl_by_market(portfolio_history, successful_trades)
 
         return {
-            # Core metrics
-            "total_return": round(total_return * 100, 4),
+            # Core metrics (total_return as decimal, e.g., -0.0046 for -0.46%)
+            "total_return": round(total_return, 6),
             "sharpe_ratio": round(sharpe, 4),
             "sortino_ratio": round(sortino, 4),
             "max_drawdown": round(max_dd * 100, 4),

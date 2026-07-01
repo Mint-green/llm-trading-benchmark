@@ -63,6 +63,12 @@ class CandidateScore:
     recency: float
     composite: float
     recent_bars: str = ""  # last 6 bars' 10-min % changes, e.g. "+0.1 -0.2 +0.3 ..."
+    # V4 trend variables
+    ret_30m: float = 0.0
+    rsi_d1h: float = 0.0
+    trend6: str = ""
+    setup: str = ""
+    recent_score: int = 0
 
 
 class Screener:
@@ -161,14 +167,17 @@ class Screener:
 
         open_market_set = set(open_markets)
 
-        # Step 1: Score all stocks (only from open markets for new candidates)
+        # Step 1: Score stocks from open markets + held positions from closed markets
         all_scores: list[CandidateScore] = []
         for market, market_bars in all_bars.items():
+            is_open = market in open_market_set
             for symbol, bars in market_bars.items():
+                # Skip closed market stocks unless they're held positions
+                if not is_open and symbol not in held_positions:
+                    continue
                 score = self._score_stock(market, symbol, bars, timestamp)
                 if score is not None:
-                    # Mark closed market stocks as not tradable for candidates
-                    if market not in open_market_set:
+                    if not is_open:
                         score.tradable = False
                     all_scores.append(score)
 
@@ -241,6 +250,7 @@ class Screener:
                 pct_nav=info.get("pnl_pct", 0.0),
                 hold_bars=info.get("hold_bars", 0),
                 sellable=info.get("sellable", True),
+                tradable=info.get("tradable", True),
                 plan_status=info.get("plan_status", ""),
                 risk_note=info.get("risk_note", ""),
             ))
@@ -313,6 +323,11 @@ class Screener:
                     trend=s.trend,
                     volatility=s.volatility_rank,
                     liquidity=s.volume_rank,
+                    ret_30m=s.ret_30m,
+                    rsi_d1h=s.rsi_d1h,
+                    trend6=s.trend6,
+                    setup=s.setup,
+                    recent_score=s.recent_score,
                 ))
                 continue
 
@@ -331,6 +346,11 @@ class Screener:
                     trend=s.trend,
                     cost_bps=self._market_cost_bps(s.market),
                     recent_bars=s.recent_bars,
+                    ret_30m=s.ret_30m,
+                    rsi_d1h=s.rsi_d1h,
+                    trend6=s.trend6,
+                    setup=s.setup,
+                    recent_score=s.recent_score,
                 ))
                 continue
 
@@ -347,6 +367,11 @@ class Screener:
                     rsi=s.rsi,
                     trend=s.trend,
                     pullback_note=f"1d={s.chg_1d:+.1f}%",
+                    ret_30m=s.ret_30m,
+                    rsi_d1h=s.rsi_d1h,
+                    trend6=s.trend6,
+                    setup=s.setup,
+                    recent_score=s.recent_score,
                 ))
                 continue
 
@@ -364,6 +389,11 @@ class Screener:
                     trend=s.trend,
                     stabilization="RSI recovering" if s.rsi > 25 else "deeply oversold",
                     risk_note="High risk — reversal may fail",
+                    ret_30m=s.ret_30m,
+                    rsi_d1h=s.rsi_d1h,
+                    trend6=s.trend6,
+                    setup=s.setup,
+                    recent_score=s.recent_score,
                 ))
                 continue
 
@@ -379,6 +409,11 @@ class Screener:
                     atr_pct=s.atr,
                     drawdown_pct=0.0,  # TODO: compute from peak
                     cost_bps=self._market_cost_bps(s.market),
+                    ret_30m=s.ret_30m,
+                    rsi_d1h=s.rsi_d1h,
+                    trend6=s.trend6,
+                    setup=s.setup,
+                    recent_score=s.recent_score,
                 ))
                 continue
 
@@ -476,6 +511,12 @@ class Screener:
             recency=recency,
             composite=0.0,
             recent_bars=recent_bars,
+            # V4 trend variables
+            ret_30m=snap.ret_30m,
+            rsi_d1h=snap.rsi_d1h,
+            trend6=snap.trend6,
+            setup=snap.setup,
+            recent_score=snap.recent_score,
         )
 
     def _compute_percentile_ranks(self, scores: list[CandidateScore]) -> None:

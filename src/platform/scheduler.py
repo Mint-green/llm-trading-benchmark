@@ -103,7 +103,7 @@ class DecisionScheduler:
 
         # Check normal interval boundary
         if self._is_normal_decision_time(time_part):
-            if not self._last_full_decision or self._minutes_since(timestamp, self._last_full_decision) >= 30:
+            if not self._last_full_decision or self._minutes_since(timestamp, self._last_full_decision) >= 60:
                 return True
 
         return False
@@ -179,7 +179,7 @@ class DecisionScheduler:
         # Priority 3: Normal full decision (every 30min)
         if self._is_normal_decision_time(time_part):
             # Check if we already did a full decision recently
-            if not self._last_full_decision or self._minutes_since(timestamp, self._last_full_decision) >= 30:
+            if not self._last_full_decision or self._minutes_since(timestamp, self._last_full_decision) >= 60:
                 self._last_full_decision = timestamp
                 return DecisionRequest(
                     timestamp=timestamp,

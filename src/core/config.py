@@ -53,7 +53,7 @@ class CloseWindowConfig:
 @dataclass(frozen=True)
 class DecisionScheduleConfig:
     """Full decision scheduling configuration."""
-    normal_interval_minutes: int = 30
+    normal_interval_minutes: int = 60
     open_window: OpenWindowConfig = field(default_factory=OpenWindowConfig)
     close_window: CloseWindowConfig = field(default_factory=CloseWindowConfig)
 

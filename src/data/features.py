@@ -88,6 +88,13 @@ class FeatureGenerator(IFeatureGenerator):
         # High-low position (intraday)
         hl_pos = self._high_low_position(latest, relevant[-min(48, len(relevant)):])
 
+        # V4 trend variables
+        ret_30m = self._change_pct(closes, 6)  # 30-minute return (6 bars)
+        rsi_d1h = self._rsi_change(closes, 12)  # RSI change in last hour
+        trend6 = self._trend6_pattern(closes)    # 6-bar trend pattern
+        setup = self._classify_setup(trend, rsi, chg_1h, ret_30m, rsi_d1h, trend6)
+        recent_score = self._compute_recent_score(ret_30m, rsi_d1h, trend6)
+
         return IndicatorSnapshot(
             timestamp=latest.timestamp,
             price=price,
@@ -100,6 +107,11 @@ class FeatureGenerator(IFeatureGenerator):
             trend=trend,
             bb_position=round(bb_pos, 4),
             high_low_pos=round(hl_pos, 4),
+            ret_30m=round(ret_30m, 4),
+            rsi_d1h=round(rsi_d1h, 2),
+            trend6=trend6,
+            setup=setup,
+            recent_score=recent_score,
         )
 
     def compute_batch(
@@ -233,3 +245,89 @@ class FeatureGenerator(IFeatureGenerator):
             return 0.5
 
         return (latest.close - low) / (high - low)
+
+    def _rsi_change(self, closes: list[float], lookback: int) -> float:
+        """RSI change over lookback bars."""
+        if len(closes) < lookback + self.rsi_period + 1:
+            return 0.0
+        rsi_now = self._compute_rsi(closes)
+        rsi_prev = self._compute_rsi(closes[:-lookback])
+        return rsi_now - rsi_prev
+
+    @staticmethod
+    def _trend6_pattern(closes: list[float]) -> str:
+        """6-bar trend pattern using arrows."""
+        if len(closes) < 7:
+            return ""
+        bars = closes[-6:]
+        pattern = []
+        for i in range(1, len(bars)):
+            ret = (bars[i] - bars[i-1]) / bars[i-1] * 100 if bars[i-1] != 0 else 0
+            if ret > 0.05:
+                pattern.append("↑")
+            elif ret < -0.05:
+                pattern.append("↓")
+            else:
+                pattern.append("→")
+        return "".join(pattern)
+
+    @staticmethod
+    def _classify_setup(trend: str, rsi: float, chg_1h: float, ret_30m: float, rsi_d1h: float, trend6: str) -> str:
+        """Classify setup based on v4 rules."""
+        # strong_continuation: UU, RSI 40-65, positive returns
+        if trend == "UU" and 40 <= rsi <= 65 and chg_1h > 0 and ret_30m >= 0:
+            return "strong_continuation"
+
+        # pullback_stabilizing: UU, RSI 30-55, positive 5d, not worsening
+        if trend == "UU" and 30 <= rsi <= 55 and ret_30m >= -0.3 and rsi_d1h >= 0:
+            return "pullback_stabilizing"
+
+        # oversold_rebounding: RSI 20-40, improving RSI, positive short-term
+        if 20 <= rsi <= 40 and rsi_d1h >= 3 and ret_30m > 0:
+            # Check trend6: last 3 bars at least 2 are ↑ or →
+            if trend6 and len(trend6) >= 3:
+                last3 = trend6[-3:]
+                up_or_flat = sum(1 for c in last3 if c in ("↑", "→"))
+                if up_or_flat >= 2:
+                    return "oversold_rebounding"
+
+        # falling_knife: RSI < 30, still falling
+        if rsi < 30 and ret_30m < 0 and rsi_d1h <= 0:
+            if trend6 and len(trend6) >= 3:
+                last3 = trend6[-3:]
+                down_count = sum(1 for c in last3 if c == "↓")
+                if down_count >= 2:
+                    return "falling_knife"
+
+        # extended_overbought: RSI > 70
+        if rsi > 70:
+            return "extended_overbought"
+
+        return "weak_no_signal"
+
+    @staticmethod
+    def _compute_recent_score(ret_30m: float, rsi_d1h: float, trend6: str) -> int:
+        """Compute recent_score from -2 to +2."""
+        score = 0
+
+        # Positive signals
+        if ret_30m > 0:
+            score += 1
+        if rsi_d1h >= 3:
+            score += 1
+        if trend6 and len(trend6) >= 3:
+            last3 = trend6[-3:]
+            if sum(1 for c in last3 if c == "↑") >= 2:
+                score += 1
+
+        # Negative signals
+        if ret_30m < -0.5:
+            score -= 1
+        if rsi_d1h <= -3:
+            score -= 1
+        if trend6 and len(trend6) >= 3:
+            last3 = trend6[-3:]
+            if sum(1 for c in last3 if c == "↓") >= 2:
+                score -= 1
+
+        return max(-2, min(2, score))

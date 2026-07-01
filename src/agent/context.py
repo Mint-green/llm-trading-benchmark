@@ -558,7 +558,12 @@ Avoid trades where expected edge < transaction costs."""
                 lines.append(f"{market.value}|{open_str}|N/A|{trade_allowed}|N/A|N/A|N/A|N/A")
                 continue
 
-            # Compute indicators for ALL stocks in this market
+            # Skip indicator computation for closed markets (show N/A)
+            if not is_open:
+                lines.append(f"{market.value}|{open_str}|N/A|{trade_allowed}|N/A|N/A|N/A|N/A")
+                continue
+
+            # Compute indicators for open market stocks only
             chg_1h_list = []
             chg_1d_list = []
             rsi_list = []
@@ -723,17 +728,14 @@ Avoid trades where expected edge < transaction costs."""
         if ra.execution_feedback:
             lines.append(f"recent_feedback: {'; '.join(ra.execution_feedback)}")
 
-        # Watchlist (table format with status)
+        # Watchlist (v4 structured format)
         if memory.watchlist:
             lines.append("watchlist:")
-            lines.append("symbol|condition|met|action_hint")
+            lines.append("symbol|price|current_rsi|condition|met|tradable|action_hint")
             for w in memory.watchlist:
                 condition = w.reason or ""
-                # Simple met check: if condition mentions RSI, we'd need current RSI
-                # For now, mark as unknown if not computable
-                met = "unknown"
-                action_hint = "keep_watch"
-                lines.append(f"{w.symbol}|{condition}|{met}|{action_hint}")
+                tradable = "yes" if w.tradable else "no"
+                lines.append(f"{w.symbol}|{w.current_price:.2f}|{w.current_rsi:.0f}|{condition}|{w.met}|{tradable}|{w.action_hint}")
 
         # Avoid list
         if memory.avoid_list:
@@ -761,33 +763,33 @@ Avoid trades where expected edge < transaction costs."""
             for c in items:
                 lines.append(self._format_candidate_line(c, name))
 
-        # held_positions
+        # held_positions (with tradable_now)
         fmt_bucket("held_positions", buckets.held_positions,
-                   "symbol|mkt|price|pnl_pct|trend|rsi|risk_note|suggested_action")
+                   "symbol|mkt|price|pnl_pct|trend|rsi|tradable_now|risk_note|suggested_action")
 
         # exit_watch
         fmt_bucket("exit_watch", buckets.exit_watch,
                    "symbol|mkt|price|pnl_pct|rsi|reason|action")
 
-        # trend_leaders (shortened)
+        # trend_leaders (with v4 trend variables)
         fmt_bucket("trend_leaders", buckets.trend_leaders,
-                   "symbol|mkt|price|score|1d_pct|5d_pct|rsi|trend|cost|risk")
+                   "symbol|mkt|price|score|1d|5d|rsi|rsi_d1h|ret_30m|trend6|setup|recent_score|risk")
 
-        # pullback_continuation (shortened)
+        # pullback_continuation (with v4 trend variables)
         fmt_bucket("pullback_continuation", buckets.pullback_continuation,
-                   "symbol|mkt|price|score|1d_pct|5d_pct|rsi|trend|risk")
+                   "symbol|mkt|price|score|1d|5d|rsi|rsi_d1h|ret_30m|trend6|setup|recent_score|risk")
 
-        # oversold_reversal (shortened)
+        # oversold_reversal (with v4 trend variables)
         fmt_bucket("oversold_reversal", buckets.oversold_reversal,
-                   "symbol|mkt|price|score|1d_pct|5d_pct|rsi|trend|risk")
+                   "symbol|mkt|price|score|1d|5d|rsi|rsi_d1h|ret_30m|trend6|setup|recent_score|risk")
 
-        # low_vol_defensive (shortened)
+        # low_vol_defensive (with v4 trend variables)
         fmt_bucket("low_vol_defensive", buckets.low_vol_defensive,
-                   "symbol|mkt|price|score|1d_pct|rsi|atr%|cost|risk")
+                   "symbol|mkt|price|score|1d|rsi|rsi_d1h|ret_30m|trend6|setup|recent_score|risk")
 
-        # crypto_candidates (shortened)
+        # crypto_candidates (with v4 trend variables)
         fmt_bucket("crypto_candidates", buckets.crypto_candidates,
-                   "symbol|price|score|1d_pct|rsi|vol|risk")
+                   "symbol|price|score|1d|rsi|rsi_d1h|ret_30m|trend6|setup|recent_score|risk")
 
         # blocked_or_warning
         fmt_bucket("blocked_or_warning", buckets.blocked_or_warning,
@@ -811,12 +813,16 @@ Avoid trades where expected edge < transaction costs."""
         return ""
 
     def _format_candidate_line(self, c: CandidateInBucket, bucket_name: str) -> str:
-        """Format a single candidate line based on bucket type (shortened format)."""
+        """Format a single candidate line based on bucket type (v4 format with trend variables)."""
         risk = self._risk_tag(c, bucket_name)
 
+        # Common trend variable suffix
+        trend_vars = f"{c.rsi_d1h:+.0f}|{c.ret_30m:+.1f}|{c.trend6}|{c.setup}|{c.recent_score:+d}"
+
         if bucket_name == "held_positions":
+            tradable = "yes" if c.tradable else "no"
             return (f"{c.ticker}|{c.market.value}|{c.price:.2f}|{c.pnl_pct:+.1f}%|"
-                    f"{c.trend}|{c.risk_note}|hold")
+                    f"{c.trend}|{c.rsi:.0f}|{tradable}|{c.risk_note}|hold")
 
         if bucket_name == "exit_watch":
             return (f"{c.ticker}|{c.market.value}|{c.price:.2f}|{c.pnl_pct:+.1f}%|"
@@ -824,28 +830,23 @@ Avoid trades where expected edge < transaction costs."""
 
         if bucket_name == "trend_leaders":
             return (f"{c.ticker}|{c.market.value}|{c.price:.2f}|{c.score:.2f}|"
-                    f"{c.chg_1d:+.1f}|{c.chg_5d:+.1f}|{c.rsi:.0f}|{c.trend}|"
-                    f"{c.cost_bps:.0f}bps|{risk}")
+                    f"{c.chg_1d:+.1f}|{c.chg_5d:+.1f}|{c.rsi:.0f}|{trend_vars}|{risk}")
 
         if bucket_name == "pullback_continuation":
             return (f"{c.ticker}|{c.market.value}|{c.price:.2f}|{c.score:.2f}|"
-                    f"{c.chg_1d:+.1f}|{c.chg_5d:+.1f}|{c.rsi:.0f}|{c.trend}|{risk}")
+                    f"{c.chg_1d:+.1f}|{c.chg_5d:+.1f}|{c.rsi:.0f}|{trend_vars}|{risk}")
 
         if bucket_name == "oversold_reversal":
             return (f"{c.ticker}|{c.market.value}|{c.price:.2f}|{c.score:.2f}|"
-                    f"{c.chg_1d:+.1f}|{c.chg_5d:+.1f}|{c.rsi:.0f}|{c.trend}|{risk}")
+                    f"{c.chg_1d:+.1f}|{c.chg_5d:+.1f}|{c.rsi:.0f}|{trend_vars}|{risk}")
 
         if bucket_name == "low_vol_defensive":
             return (f"{c.ticker}|{c.market.value}|{c.price:.2f}|{c.score:.2f}|"
-                    f"{c.chg_5d:+.1f}|{c.rsi:.0f}|{c.atr_pct:.2f}|"
-                    f"{c.cost_bps:.0f}bps|{risk}")
+                    f"{c.chg_5d:+.1f}|{c.rsi:.0f}|{trend_vars}|{risk}")
 
         if bucket_name == "crypto_candidates":
             return (f"{c.ticker}|{c.price:.2f}|{c.score:.2f}|"
-                    f"{c.chg_1d:+.1f}|{c.rsi:.0f}|{c.volatility:.2f}|{risk}")
-            return (f"{c.ticker}|{c.price:.2f}|{c.score:.2f}|"
-                    f"{c.chg_1h:+.2f}|{c.chg_1d:+.2f}|{c.chg_5d:+.2f}|"
-                    f"{c.rsi:.0f}|{c.volatility:.2f}|{c.liquidity:.2f}|{c.risk_note}")
+                    f"{c.chg_1d:+.1f}|{c.rsi:.0f}|{trend_vars}|{risk}")
 
         if bucket_name == "blocked_or_warning":
             return f"{c.ticker}|{c.market.value}|{c.reason}|{c.allowed_action}"

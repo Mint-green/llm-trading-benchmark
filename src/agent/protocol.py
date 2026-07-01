@@ -26,6 +26,10 @@ class DecisionProtocol:
 
         action = data.get("action", "").lower()
 
+        # Extract memory_updates and plan_updates (v3 format)
+        memory_updates = data.get("memory_updates", {})
+        plan_updates = data.get("plan_updates", [])
+
         # v3 format: rebalance with portfolio_targets
         if action == "rebalance":
             targets = data.get("portfolio_targets", [])
@@ -35,6 +39,8 @@ class DecisionProtocol:
                 trades=trades,
                 reason=data.get("reason", ""),
                 queries=[],
+                memory_updates=memory_updates,
+                plan_updates=plan_updates,
             )
 
         # v2 format: trade with trades list
@@ -44,14 +50,31 @@ class DecisionProtocol:
                 trade = self._parse_trade(t)
                 if trade:
                     trades.append(trade)
-            return Decision(action="trade", trades=trades, reason=data.get("reason", ""))
+            return Decision(
+                action="trade",
+                trades=trades,
+                reason=data.get("reason", ""),
+                memory_updates=memory_updates,
+                plan_updates=plan_updates,
+            )
 
         elif action == "hold":
-            return Decision(action="hold", reason=data.get("reason", ""))
+            return Decision(
+                action="hold",
+                reason=data.get("reason", ""),
+                memory_updates=memory_updates,
+                plan_updates=plan_updates,
+            )
 
         elif action == "query":
             queries = data.get("queries", [])
-            return Decision(action="query", queries=queries, reason="")
+            return Decision(
+                action="query",
+                queries=queries,
+                reason="",
+                memory_updates=memory_updates,
+                plan_updates=plan_updates,
+            )
 
         return None
 

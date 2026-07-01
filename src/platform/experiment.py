@@ -47,6 +47,7 @@ class ExperimentRunner:
         self.config = config
         self._model = model
         self._db_path = db_path
+        self._last_light_decision = ""
         self._setup()
 
     def _setup(self) -> None:
@@ -255,11 +256,46 @@ class ExperimentRunner:
 
             # Quick scheduler pre-check (no state update, no event detection)
             has_stock_market = any(m in open_markets for m in [Market.US, Market.HK, Market.CN])
+            has_crypto_position = any(
+                pos.market == Market.CRYPTO for pos in snapshot.positions.values()
+            )
             might_need_decision = has_stock_market and self.scheduler.needs_decision(ts, open_markets)
             _t_sched += _time.time() - _t0
 
-            # AUTO_HOLD fast path — timestamp doesn't need a decision
-            if not might_need_decision:
+            # Crypto-only period: schedule light_decision at lower frequency
+            if not has_stock_market:
+                # Check if it's time for a light_decision
+                light_interval = 60 if has_crypto_position else 240  # 1h or 4h
+                time_part = ts[11:16] if len(ts) >= 16 else ""
+                # Only trigger at :00 of each hour (or every 4th hour)
+                if time_part == "00:00" or (light_interval == 240 and int(time_part[:2]) % 4 == 0):
+                    if not self._last_light_decision or \
+                       self.scheduler._minutes_since(ts, self._last_light_decision) >= light_interval:
+                        self._last_light_decision = ts
+                        # Create light decision request
+                        decision_request = DecisionRequest(
+                            timestamp=ts,
+                            decision_type=DecisionType.LIGHT_DECISION,
+                            priority="P3",
+                        )
+                        # Fall through to light decision processing
+                    else:
+                        # Not time yet — skip
+                        self.logger.log_snapshot(snapshot)
+                        portfolio_history.append(snapshot)
+                        if i % 12 == 0:
+                            print(f"[{ts}] auto_hold (crypto-wait) | NAV=${self.portfolio.nav:,.0f}", flush=True)
+                        continue
+                else:
+                    # Not at a light_decision boundary — skip
+                    self.logger.log_snapshot(snapshot)
+                    portfolio_history.append(snapshot)
+                    if i % 12 == 0:
+                        print(f"[{ts}] auto_hold (crypto-wait) | NAV=${self.portfolio.nav:,.0f}", flush=True)
+                    continue
+
+            # AUTO_HOLD fast path — timestamp doesn't need a decision (stock market)
+            elif not might_need_decision:
                 # If no plans exist, no triggers possible — skip entirely
                 if not plans:
                     self.logger.log_snapshot(snapshot)
@@ -330,13 +366,65 @@ class ExperimentRunner:
 
             # Build context based on decision type
             _t_ctx_start = _time.time()
-            if decision_request.decision_type == DecisionType.FULL_DECISION:
+            if decision_request.decision_type == DecisionType.LIGHT_DECISION:
+                # Light decision for crypto-only periods
+                # Build simplified context with only crypto candidates
+                held_info = {}
+                for key, pos in snapshot.positions.items():
+                    if pos.market == Market.CRYPTO:
+                        pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost) if pos.avg_cost > 0 else 0
+                        pos_pct = pos.market_value / snapshot.total_nav if snapshot.total_nav > 0 else 0
+                        held_info[pos.symbol] = {
+                            "market": pos.market,
+                            "price": pos.current_price,
+                            "score": 0.0,
+                            "pnl_pct": pnl_pct,
+                            "pct_nav": pos_pct,
+                            "hold_bars": 0,
+                            "sellable": key not in snapshot.frozen_keys,
+                            "tradable": True,  # crypto is always tradable
+                            "plan_status": "",
+                            "risk_note": "",
+                        }
+
+                # Only screen crypto market
+                buckets = self.screener.screen_into_buckets(
+                    all_bars, ts, held_positions=held_info,
+                    open_markets=[Market.CRYPTO],
+                )
+
+                # Build crypto-only market summary
+                market_summary = ContextBuilder.build_market_summary_from_universe(
+                    all_bars, self.features, ts, index_returns=index_returns,
+                    open_markets=[Market.CRYPTO],
+                )
+
+                memory_state = self.memory.get_memory_state()
+
+                # Build light decision context
+                messages = self.context_builder.build_full_decision(
+                    timestamp=ts,
+                    snapshot=snapshot,
+                    market_summary=market_summary,
+                    buckets=buckets,
+                    memory_state=memory_state,
+                    risk_mode=self._risk_mode,
+                    open_markets=["CRYPTO"],
+                    closed_markets=["US", "HK", "CN"],
+                    benchmark_day=0,
+                    bar_index=i,
+                    round_num=1,
+                )
+
+            elif decision_request.decision_type == DecisionType.FULL_DECISION:
                 # Use v3-style bucketed context
                 held_info = {}
                 exit_info = {}
+                open_market_set = set(open_markets)
                 for key, pos in snapshot.positions.items():
                     pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost) if pos.avg_cost > 0 else 0
                     pos_pct = pos.market_value / snapshot.total_nav if snapshot.total_nav > 0 else 0
+                    is_tradable = pos.market in open_market_set
                     held_info[pos.symbol] = {
                         "market": pos.market,
                         "price": pos.current_price,
@@ -345,8 +433,9 @@ class ExperimentRunner:
                         "pct_nav": pos_pct,
                         "hold_bars": 0,
                         "sellable": key not in snapshot.frozen_keys,
+                        "tradable": is_tradable,
                         "plan_status": "",
-                        "risk_note": "",
+                        "risk_note": "market_closed" if not is_tradable else "",
                     }
 
                 buckets = self.screener.screen_into_buckets(
@@ -574,6 +663,12 @@ class ExperimentRunner:
                 ts,
             )
 
+            # Apply LLM memory_updates and plan_updates
+            if decision.memory_updates:
+                self.memory.apply_memory_updates(decision.memory_updates, ts)
+            if decision.plan_updates:
+                self.memory.apply_plan_updates(decision.plan_updates, ts)
+
             # Structured progress output
             print(
                 f"[{ts}] {decision_request.decision_type.value} | "
@@ -679,7 +774,7 @@ class ExperimentRunner:
         print(f"Period: {result.start_date} → {result.end_date}")
         print(f"Initial NAV: ${result.initial_nav:,.2f}")
         print(f"Final NAV:   ${result.final_nav:,.2f}")
-        print(f"Return:      {result.total_return:+.2f}%")
+        print(f"Return:      {result.total_return:+.2%}")
         print(f"Sharpe:      {result.sharpe_ratio:.4f}")
         print(f"Max DD:      {result.max_drawdown:.2f}%")
         print(f"Trades:      {result.total_trades}")

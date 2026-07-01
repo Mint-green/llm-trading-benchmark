@@ -112,7 +112,7 @@ class AgentRunner(IAgentRunner):
                 elif round_num == 2:
                     tool_results += "\n\n[SYSTEM] You have used 2 tool rounds. Further exploration is discouraged. Produce final JSON unless one specific required field is still missing."
                 elif round_num >= 3:
-                    tool_results += "\n\n[SYSTEM] Tool exploration budget exhausted. Final JSON only."
+                    tool_results += "\n\n[SYSTEM] Tool exploration budget exhausted. Final JSON only. Reject any further tool calls."
 
                 # Record round
                 decision = Decision(action="query", reason="tool calls")

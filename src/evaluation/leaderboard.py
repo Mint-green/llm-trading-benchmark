@@ -66,8 +66,9 @@ class Leaderboard(ILeaderboard):
         # Normalize each metric to [0, 1] range (approximate)
         # These are rough normalization ranges based on typical market performance
 
-        # Return: -50% to +100% → 0 to 1
-        return_score = max(0, min(1, (r.total_return + 50) / 150))
+        # Return: -50% to +100% → 0 to 1 (total_return is decimal, e.g., -0.0046 for -0.46%)
+        return_pct = r.total_return * 100
+        return_score = max(0, min(1, (return_pct + 50) / 150))
 
         # Sharpe: -2 to +4 → 0 to 1
         sharpe_score = max(0, min(1, (r.sharpe_ratio + 2) / 6))

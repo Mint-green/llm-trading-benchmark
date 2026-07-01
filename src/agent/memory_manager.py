@@ -269,6 +269,158 @@ class MemoryManager:
             del self._avoid[sym]
         return expired
 
+    # --- Apply LLM Updates ---
+
+    def apply_memory_updates(self, updates: dict, timestamp: str = "") -> None:
+        """Apply memory_updates from LLM output.
+
+        Expected format:
+        {
+            "daily_thesis": "market is bullish" | null,
+            "add_watch": [{"symbol": "AAPL.US", "reason": "RSI recovering"}],
+            "add_avoid": [{"symbol": "TSLA.US", "reason": "high volatility"}],
+            "remove_watch": ["AAPL.US"],
+            "remove_avoid": ["TSLA.US"],
+        }
+        """
+        if not updates:
+            return
+
+        # Update daily thesis
+        thesis_text = updates.get("daily_thesis")
+        if thesis_text:
+            self._thesis = DailyThesis(
+                text=thesis_text,
+                created_at=timestamp,
+            )
+
+        # Add watchlist items
+        for item in updates.get("add_watch", []):
+            if isinstance(item, dict):
+                symbol = item.get("symbol", "")
+                reason = item.get("reason", "")
+            elif isinstance(item, str):
+                # Handle simple string format: "AAPL.US: RSI recovering"
+                parts = item.split(":", 1)
+                symbol = parts[0].strip()
+                reason = parts[1].strip() if len(parts) > 1 else ""
+            else:
+                continue
+            if symbol:
+                self.add_watch(symbol, reason, timestamp=timestamp)
+
+        # Add avoid items
+        for item in updates.get("add_avoid", []):
+            if isinstance(item, dict):
+                symbol = item.get("symbol", "")
+                reason = item.get("reason", "")
+            elif isinstance(item, str):
+                parts = item.split(":", 1)
+                symbol = parts[0].strip()
+                reason = parts[1].strip() if len(parts) > 1 else ""
+            else:
+                continue
+            if symbol:
+                self.add_avoid(symbol, reason, timestamp=timestamp)
+
+        # Remove watchlist items
+        for symbol in updates.get("remove_watch", []):
+            if isinstance(symbol, str) and symbol:
+                self.remove_watch(symbol)
+
+        # Remove avoid items
+        for symbol in updates.get("remove_avoid", []):
+            if isinstance(symbol, str) and symbol:
+                self.remove_avoid(symbol)
+
+    def apply_plan_updates(self, updates: list[dict], timestamp: str = "") -> None:
+        """Apply plan_updates from LLM output.
+
+        Expected format:
+        [
+            {"symbol": "AAPL.US", "action": "create", "stop_loss": 150, "take_profit": 180},
+            {"symbol": "TSLA.US", "action": "update", "stop_loss": 200},
+            {"symbol": "NVDA.US", "action": "close"},
+        ]
+        """
+        if not updates:
+            return
+
+        for update in updates:
+            symbol = update.get("symbol", "")
+            action = update.get("action", "").lower()
+
+            if not symbol or not action:
+                continue
+
+            if action == "create":
+                # Create new plan
+                stop_loss = update.get("stop_loss")
+                take_profit = update.get("take_profit")
+                note = update.get("note", "")
+                triggers = []
+                if stop_loss:
+                    triggers.append(PlanTrigger(
+                        trigger_type=TriggerType.PRICE_MOVE_PCT,
+                        threshold=stop_loss,
+                        direction="below",
+                    ))
+                if take_profit:
+                    triggers.append(PlanTrigger(
+                        trigger_type=TriggerType.PRICE_MOVE_PCT,
+                        threshold=take_profit,
+                        direction="above",
+                    ))
+                self.create_plan(
+                    symbol=symbol,
+                    action=PlanAction.CREATE,
+                    triggers=triggers,
+                    note=note,
+                    timestamp=timestamp,
+                )
+
+            elif action == "update":
+                # Update existing plan
+                plan = self._plans.get(symbol)
+                if plan:
+                    if "stop_loss" in update:
+                        # Update or add stop loss trigger
+                        for t in plan.triggers:
+                            if t.trigger_type == TriggerType.PRICE_MOVE_PCT and t.direction == "below":
+                                t.threshold = update["stop_loss"]
+                                break
+                        else:
+                            plan.triggers.append(PlanTrigger(
+                                trigger_type=TriggerType.PRICE_MOVE_PCT,
+                                threshold=update["stop_loss"],
+                                direction="below",
+                            ))
+                    if "take_profit" in update:
+                        # Update or add take profit trigger
+                        for t in plan.triggers:
+                            if t.trigger_type == TriggerType.PRICE_MOVE_PCT and t.direction == "above":
+                                t.threshold = update["take_profit"]
+                                break
+                        else:
+                            plan.triggers.append(PlanTrigger(
+                                trigger_type=TriggerType.PRICE_MOVE_PCT,
+                                threshold=update["take_profit"],
+                                direction="above",
+                            ))
+                    if "note" in update:
+                        plan.note = update["note"]
+                    plan.last_review_time = timestamp
+
+            elif action == "close":
+                # Close plan
+                self.close_plan(symbol, timestamp)
+
+            elif action == "no_change":
+                # Just update review time
+                plan = self._plans.get(symbol)
+                if plan:
+                    plan.last_review_time = timestamp
+
     # --- Recent Activity ---
 
     def record_decision(

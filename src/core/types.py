@@ -68,6 +68,7 @@ class DecisionType(str, Enum):
     """Decision types for the scheduling system."""
     AUTO_HOLD = "auto_hold"
     FULL_DECISION = "full_decision"
+    LIGHT_DECISION = "light_decision"
     FOCUSED_POSITION = "focused_position_decision"
     FOCUSED_MARKET_RISK = "focused_market_or_risk_decision"
 
@@ -161,6 +162,12 @@ class IndicatorSnapshot:
     trend: str            # "UU", "UD", "DU", "DD"
     bb_position: float    # Bollinger Band position [0,1]
     high_low_pos: float   # intraday high-low position [0,1]
+    # V4 trend variables
+    ret_30m: float = 0.0      # 30-minute return (6 bars)
+    rsi_d1h: float = 0.0      # RSI change in last hour
+    trend6: str = ""           # 6-bar trend pattern (e.g., "↑↑→↑↑↑")
+    setup: str = ""            # setup classification
+    recent_score: int = 0      # short-term state score (-2 to +2)
 
 
 # ============================================================
@@ -228,6 +235,9 @@ class Decision:
     trades: list[TradeOrder] = field(default_factory=list)
     queries: list[dict[str, str]] = field(default_factory=list)
     reason: str = ""
+    # V3 memory and plan updates
+    memory_updates: dict = field(default_factory=dict)
+    plan_updates: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -303,6 +313,12 @@ class CandidateInBucket:
     volatility: float = 0.0    # for crypto_candidates
     liquidity: float = 0.0     # for crypto_candidates
     recent_bars: str = ""      # for trend_leaders
+    # V4 trend variables
+    ret_30m: float = 0.0       # 30-minute return
+    rsi_d1h: float = 0.0       # RSI change in last hour
+    trend6: str = ""           # 6-bar trend pattern
+    setup: str = ""            # setup classification
+    recent_score: int = 0      # short-term state score (-2 to +2)
 
 
 @dataclass
@@ -388,6 +404,12 @@ class WatchlistItem:
     source_event_id: str = ""
     created_at: str = ""
     expires_at: str = ""
+    # V4 structured fields
+    current_price: float = 0.0
+    current_rsi: float = 0.0
+    met: str = "unknown"  # "yes", "no", "unknown"
+    tradable: bool = True
+    action_hint: str = "keep_watch"  # "keep_watch", "consider_buy", "remove"
 
 
 @dataclass
