@@ -42,6 +42,8 @@ class ExperimentLogger(IExperimentLogger):
         """Initialize a new experiment run. Returns run_id."""
         os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
         self._conn = sqlite3.connect(self._db_path)
+        # Some Windows/sandboxed filesystems reject DELETE journal cleanup.
+        self._conn.execute("PRAGMA journal_mode=TRUNCATE")
         self._create_tables()
 
         self._run_id = datetime.now().strftime("%Y%m%d_%H%M%S")

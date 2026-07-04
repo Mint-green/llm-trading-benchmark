@@ -259,6 +259,7 @@ class ToolSystem(IToolSystem):
         bucket = args.get("bucket", "trend_leaders")
         limit = args.get("limit", 10)
         filters = args.get("filters", {})
+        sort_by = args.get("sort_by", "score_total")
 
         # Determine markets to screen
         if market_str == "ALL":
@@ -266,6 +267,10 @@ class ToolSystem(IToolSystem):
         else:
             market_map = {"US": Market.US, "HK": Market.HK, "CN": Market.CN, "CRYPTO": Market.CRYPTO}
             markets = [market_map.get(market_str, Market.US)]
+
+        snapshot = self._get_snapshot()
+        nav = snapshot.total_nav if snapshot else 0
+        fx_rates = snapshot.fx_rates if snapshot else {}
 
         # Load bars and compute indicators
         results = []
@@ -286,6 +291,13 @@ class ToolSystem(IToolSystem):
                 if snap.rsi < rsi_min or snap.rsi > rsi_max:
                     continue
 
+                if market == Market.CN and nav > 0:
+                    cny_per_usd = fx_rates.get("CNY", 7.25)
+                    min_lot_usd = (snap.price * 100) / cny_per_usd
+                    if min_lot_usd > nav * 0.045:
+                        continue
+
+                risk = self._screen_risk_tag(snap)
                 results.append({
                     "symbol": symbol,
                     "market": market.value,
@@ -295,28 +307,90 @@ class ToolSystem(IToolSystem):
                     "chg_1h": snap.chg_1h,
                     "chg_1d": snap.chg_1d,
                     "atr_pct": snap.atr_pct,
+                    "bb_position": snap.bb_position,
+                    "ret_30m": snap.ret_30m,
+                    "rsi_d1h": snap.rsi_d1h,
+                    "trend6": snap.trend6,
+                    "setup": snap.setup,
+                    "recent_score": snap.recent_score,
+                    "risk": risk,
+                    "screen_score": self._screen_score(snap, bucket, sort_by, risk),
                 })
 
-        # Sort by score (simplified: by absolute change)
-        sort_by = args.get("sort_by", "score_total")
-        if sort_by == "trend_score":
-            results.sort(key=lambda x: abs(x["chg_1d"]), reverse=True)
-        else:
-            results.sort(key=lambda x: abs(x["chg_1h"]) + abs(x["chg_1d"]), reverse=True)
+        # Sort by bucket-aware setup quality instead of raw absolute movement.
+        results.sort(key=lambda x: x["screen_score"], reverse=True)
 
         results = results[:limit]
 
         # Format output
         lines = [f"[SCREEN] {market_str} | bucket={bucket} | {len(results)} results"]
-        lines.append("symbol|mkt|price|rsi|trend|1h_chg|1d_chg|atr%")
+        lines.append("symbol|mkt|price|score|rsi|trend|1h_chg|1d_chg|atr%|rsi_d1h|ret_30m|trend6|setup|recent_score|risk")
         for r in results:
             lines.append(
                 f"{r['symbol']}|{r['market']}|{r['price']:.2f}|"
-                f"{r['rsi']:.0f}|{r['trend']}|"
-                f"{r['chg_1h']:+.2f}|{r['chg_1d']:+.2f}|{r['atr_pct']:.2f}"
+                f"{r['screen_score']:.2f}|{r['rsi']:.0f}|{r['trend']}|"
+                f"{r['chg_1h']:+.2f}|{r['chg_1d']:+.2f}|{r['atr_pct']:.2f}|"
+                f"{r['rsi_d1h']:+.0f}|{r['ret_30m']:+.1f}|{r['trend6']}|"
+                f"{r['setup']}|{r['recent_score']:+d}|{r['risk']}"
             )
         return "\n".join(lines)
 
+    @staticmethod
+    def _screen_risk_tag(snap: IndicatorSnapshot) -> str:
+        """Short, non-blocking risk tag for tool output."""
+        if snap.rsi > 70:
+            return "overbought"
+        if snap.chg_1h > 2.0 and (snap.rsi > 62 or snap.bb_position > 0.85):
+            return "extended_intraday"
+        if snap.rsi < 30 and snap.ret_30m < 0:
+            return "falling_knife"
+        return ""
+
+    @staticmethod
+    def _screen_score(
+        snap: IndicatorSnapshot, bucket: str, sort_by: str, risk: str,
+    ) -> float:
+        """Bucket-aware ranking score for screen_universe.
+
+        The score is only for ordering tool results; it does not remove
+        candidates, so stronger models can still choose extended winners.
+        """
+        setup_rank = {
+            "strong_continuation": 4.0,
+            "pullback_stabilizing": 3.5,
+            "oversold_rebounding": 3.0,
+            "weak_actionable": 1.5,
+            "weak_no_signal": 0.0,
+            "falling_knife": -2.5,
+            "extended_overbought": -2.5,
+        }.get(snap.setup, 0.0)
+
+        trend_bonus = 1.0 if snap.trend == "UU" else 0.4 if snap.trend in ("UD", "DU") else -0.5
+        risk_penalty = 1.5 if risk == "extended_intraday" else 2.5 if risk else 0.0
+
+        if sort_by == "volume_rank":
+            return abs(snap.chg_1h) + abs(snap.chg_1d) - risk_penalty
+        if sort_by == "cost_efficiency":
+            return setup_rank + snap.recent_score * 0.6 - snap.atr_pct * 0.1 - risk_penalty
+
+        if bucket == "pullback_continuation":
+            pullback_fit = 1.5 if snap.setup == "pullback_stabilizing" else 0.0
+            not_worsening = 0.8 if snap.rsi_d1h >= 0 and snap.ret_30m >= -0.3 else -0.8
+            return pullback_fit + setup_rank + not_worsening + snap.recent_score * 0.6 - risk_penalty
+
+        if bucket == "oversold_reversal":
+            oversold_fit = 1.5 if snap.setup == "oversold_rebounding" else 0.0
+            rsi_fit = 0.8 if 25 <= snap.rsi <= 45 else -0.5
+            return oversold_fit + setup_rank + rsi_fit + snap.recent_score * 0.7 - risk_penalty
+
+        if bucket == "low_vol_defensive":
+            return setup_rank + trend_bonus + snap.recent_score * 0.5 - snap.atr_pct * 0.3 - risk_penalty
+
+        if bucket == "volume_breakout":
+            return setup_rank + trend_bonus + snap.recent_score * 0.7 + max(snap.chg_1h, 0) * 0.2 - risk_penalty
+
+        # trend_leaders/custom/default: prefer actionable setup over raw movement.
+        return setup_rank + trend_bonus + snap.recent_score * 0.8 + max(snap.chg_1d, 0) * 0.05 - risk_penalty
     def _query_asset(self, args: dict, timestamp: str) -> str:
         """Query detailed asset info."""
         symbol = args.get("symbol", "")

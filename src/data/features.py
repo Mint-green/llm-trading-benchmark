@@ -303,6 +303,10 @@ class FeatureGenerator(IFeatureGenerator):
         if rsi > 70:
             return "extended_overbought"
 
+        # weak_actionable: RSI 30-60 with any positive signal
+        if 30 <= rsi <= 60 and (ret_30m > 0 or rsi_d1h > 0):
+            return "weak_actionable"
+
         return "weak_no_signal"
 
     @staticmethod

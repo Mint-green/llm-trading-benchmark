@@ -160,6 +160,7 @@ class ContextBuilder(IContextBuilder):
         open_str = ", ".join(open_markets) if open_markets else "none"
         closed_str = ", ".join(closed_markets) if closed_markets else "none"
         user_blocks.append(f"[OPEN MARKETS] OPEN: {open_str} | CLOSED: {closed_str}")
+        user_blocks.append(self._format_market_timing(timestamp, open_markets))
         user_blocks.append("")
 
         # --- Layer 4: PORTFOLIO ---
@@ -545,7 +546,7 @@ Avoid trades where expected edge < transaction costs."""
         }
 
         lines = ["[MARKET_SUMMARY]"]
-        lines.append("Market|Open|Regime|TradeAllowed|Universe1H|Universe1D|Breadth|Vol")
+        lines.append("Market|Open|TradeAllowed|Universe1H|Universe1D|Breadth|Vol")
 
         for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO]:
             market_bars = all_bars.get(market, {})
@@ -555,12 +556,12 @@ Avoid trades where expected edge < transaction costs."""
 
             if not market_bars:
                 idx = index_defaults.get(market, "?")
-                lines.append(f"{market.value}|{open_str}|N/A|{trade_allowed}|N/A|N/A|N/A|N/A")
+                lines.append(f"{market.value}|{open_str}|{trade_allowed}|N/A|N/A|N/A|N/A")
                 continue
 
             # Skip indicator computation for closed markets (show N/A)
             if not is_open:
-                lines.append(f"{market.value}|{open_str}|N/A|{trade_allowed}|N/A|N/A|N/A|N/A")
+                lines.append(f"{market.value}|{open_str}|{trade_allowed}|N/A|N/A|N/A|N/A")
                 continue
 
             # Compute indicators for open market stocks only
@@ -591,24 +592,8 @@ Avoid trades where expected edge < transaction costs."""
             bull_ratio = bull_count / n
             avg_atr = sum(atr_list) / n
 
-            # Compute regime: GREEN/YELLOW/RED based on breadth ratio and avg change
-            # Use up/(up+down) as breadth ratio, not bull_ratio (RSI > 60)
-            total = up_1h + (n - up_1h)
-            breadth_ratio = up_1h / total if total > 0 else 0.5
-
-            # Regime logic:
-            # GREEN: breadth > 55% AND avg_1h > 0%
-            # RED: breadth < 40% OR avg_1h < -0.5%
-            # YELLOW: everything else
-            if breadth_ratio > 0.55 and avg_1h > 0:
-                regime = "GREEN"
-            elif breadth_ratio < 0.40 or avg_1h < -0.5:
-                regime = "RED"
-            else:
-                regime = "YELLOW"
-
             lines.append(
-                f"{market.value}|{open_str}|{regime}|{trade_allowed}|"
+                f"{market.value}|{open_str}|{trade_allowed}|"
                 f"{avg_1h:+.2f}|{avg_1d:+.2f}|"
                 f"{up_1h}/{down_1h}|{avg_atr:.3f}"
             )
@@ -681,19 +666,39 @@ Avoid trades where expected edge < transaction costs."""
         cash = snap.cash
         cash_pct = cash / nav * 100 if nav > 0 else 0
 
+        active_positions = []
+        for key, pos in snap.positions.items():
+            if pos.quantity <= 0:
+                continue
+            pos_pct = pos.market_value / nav * 100 if nav > 0 else 0
+            if pos_pct < 0.5:
+                continue
+            active_positions.append((key, pos, pos_pct))
+
+        deployed_pct = max(0.0, 100.0 - cash_pct)
+        if len(active_positions) >= 10 or cash_pct < 55:
+            new_buy_mode = "stop_or_exceptional_only"
+        elif len(active_positions) >= 6 or cash_pct < 70:
+            new_buy_mode = "selective_one_buy_max"
+        else:
+            new_buy_mode = "build_best_1_to_2"
+
         lines.append(f"NAV_USD={nav:,.2f}")
         lines.append(f"cash_pct_nav={cash_pct:.1f}%")
+        lines.append(f"deployed_pct_nav={deployed_pct:.1f}%")
+        lines.append(f"open_positions={len(active_positions)}")
+        lines.append(f"new_buy_mode={new_buy_mode}")
         lines.append(f"risk_mode={risk_mode.value}")
+        if snap.market_exposure:
+            exposure = ", ".join(
+                f"{m.value}:{v / nav * 100:.1f}%" for m, v in snap.market_exposure.items()
+            )
+            lines.append(f"market_exposure={exposure}")
         lines.append("")
 
-        if snap.positions:
+        if active_positions:
             lines.append("symbol|mkt|pct_nav|pnl_pct|hold_bars|trend|rsi|sellable|plan_status|risk_note")
-            for key, pos in snap.positions.items():
-                if pos.quantity <= 0:
-                    continue
-                pos_pct = pos.market_value / nav * 100 if nav > 0 else 0
-                if pos_pct < 0.5:
-                    continue
+            for key, pos, pos_pct in active_positions:
                 pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost > 0 else 0
                 frozen = key in snap.frozen_keys
                 sellable = "no" if frozen else "yes"
@@ -727,6 +732,8 @@ Avoid trades where expected edge < transaction costs."""
             lines.append(f"recent_decisions: {'; '.join(ra.non_hold_decisions)}")
         if ra.execution_feedback:
             lines.append(f"recent_feedback: {'; '.join(ra.execution_feedback)}")
+        if ra.risk_state_changes:
+            lines.append(f"risk_state: {'; '.join(ra.risk_state_changes)}")
 
         # Watchlist (v4 structured format)
         if memory.watchlist:
@@ -852,6 +859,56 @@ Avoid trades where expected edge < transaction costs."""
             return f"{c.ticker}|{c.market.value}|{c.reason}|{c.allowed_action}"
 
         return ""
+
+    @staticmethod
+    def _format_market_timing(timestamp: str, open_markets: list[str]) -> str:
+        """Format open-market time remaining and tail-guard status."""
+        from datetime import datetime
+
+        sessions = {
+            "US": [("14:30", "21:00")],
+            "HK": [("01:30", "04:00"), ("05:00", "08:00")],
+            "CN": [("01:30", "03:30"), ("05:00", "07:00")],
+        }
+        open_set = set(open_markets)
+        time_part = timestamp[11:16] if len(timestamp) >= 16 else ""
+        lines = ["[MARKET_TIMING]"]
+        lines.append("market|status|minutes_to_close|minutes_to_tail_guard|action_note")
+
+        for market in ["US", "HK", "CN"]:
+            if market not in open_set:
+                lines.append(f"{market}|closed|N/A|N/A|do_not_trade")
+                continue
+
+            minutes_to_close = None
+            try:
+                current = datetime.strptime(time_part, "%H:%M")
+                for open_time, close_time in sessions[market]:
+                    open_dt = datetime.strptime(open_time, "%H:%M")
+                    close_dt = datetime.strptime(close_time, "%H:%M")
+                    if open_dt <= current < close_dt:
+                        minutes_to_close = int((close_dt - current).total_seconds() / 60)
+                        break
+            except ValueError:
+                minutes_to_close = None
+
+            if minutes_to_close is None:
+                lines.append(f"{market}|closed|N/A|N/A|do_not_trade")
+                continue
+
+            minutes_to_tail = max(0, minutes_to_close - 15)
+            if minutes_to_close <= 15:
+                note = "tail_guard_active_no_new_buys"
+            elif minutes_to_tail <= 15:
+                note = "last_chance_buy_now_or_skip"
+            elif minutes_to_tail <= 60:
+                note = "buy_qualified_setups_before_tail_guard"
+            else:
+                note = "normal"
+            lines.append(f"{market}|open|{minutes_to_close}|{minutes_to_tail}|{note}")
+
+        lines.append("CRYPTO|open|N/A|N/A|always_open")
+        return "\n".join(lines)
 
     def _format_decision_context(
         self, timestamp: str, decision_type: str,

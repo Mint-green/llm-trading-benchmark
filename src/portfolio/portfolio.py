@@ -209,12 +209,12 @@ class PortfolioEngine(IPortfolioEngine):
         """Full order processing pipeline: rules → constraints → FX → execution → settlement."""
         result = None
 
-        # 1. Sell limit per decision (max 2 SELLs to prevent panic selling)
+        # 1. Sell limit per decision (max 3 SELLs)
         if order.side == OrderSide.SELL:
-            if self._constraints._sells_this_decision >= 2:
+            if self._constraints._sells_this_decision >= 3:
                 result = TradeResult(
                     order=order, success=False,
-                    error="limit: max 2 SELLs per decision (prevent panic selling). Sell gradually across decisions."
+                    error="limit: max 3 SELLs per decision. Sell gradually across decisions."
                 )
                 self._trade_history.append(result)
                 return result

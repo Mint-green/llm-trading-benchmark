@@ -512,8 +512,44 @@ class ExperimentRunner:
 
             _t_ctx = _time.time() - _t_ctx_start
 
+            # --- Auto stop-loss: sell positions exceeding threshold ---
+            auto_sell_feedback = []
+            stop_loss_pct = -0.03  # -3% stop-loss
+            for key, pos in list(snapshot.positions.items()):
+                if pos.quantity <= 0 or pos.avg_cost <= 0:
+                    continue
+                pnl_pct = (pos.current_price - pos.avg_cost) / pos.avg_cost
+                if pnl_pct <= stop_loss_pct:
+                    # Check if position is sellable (not frozen, market open)
+                    is_tradable = pos.market in open_markets
+                    is_frozen = key in snapshot.frozen_keys
+                    if is_tradable and not is_frozen:
+                        from src.core.types import TradeOrder, OrderSide
+                        sell_order = TradeOrder(
+                            symbol=pos.symbol,
+                            market=pos.market,
+                            side=OrderSide.SELL,
+                            quantity=pos.quantity,
+                            reason=f"auto_stop_loss: PnL={pnl_pct*100:.1f}% <= {stop_loss_pct*100:.0f}%",
+                        )
+                        price = self._get_price(pos.symbol, pos.market, ts, all_bars)
+                        if price:
+                            result = self.portfolio.process_order(sell_order, price, ts)
+                            self.logger.log_trade(result, ts)
+                            if result.success:
+                                auto_sell_feedback.append(f"AUTO SELL {pos.symbol}({pos.market.value}): PnL={pnl_pct*100:.1f}% hit stop-loss")
+                                print(f"  [{ts}] AUTO STOP-LOSS: SELL {pos.symbol}({pos.market.value}) PnL={pnl_pct*100:.1f}%", flush=True)
+            if auto_sell_feedback:
+                # Refresh snapshot after auto-sells
+                snapshot = self.portfolio.get_snapshot(ts)
+                self.memory.record_risk_change(
+                    "loss_cooldown: " + "; ".join(auto_sell_feedback[-3:]) +
+                    " | pause new BUYs except exceptional +2 setups; no immediate replacement trade",
+                    ts,
+                )
+
             # Run agent
-            trade_feedback = ""
+            trade_feedback = "\n".join(auto_sell_feedback) if auto_sell_feedback else ""
             decision = Decision(action="hold", reason="no decision")
             rounds = []
 

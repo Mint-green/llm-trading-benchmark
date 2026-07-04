@@ -75,6 +75,14 @@ class AgentRunner(IAgentRunner):
         """
         rounds: list[AgentRound] = []
         tool_results = ""
+        tool_history: list[str] = []
+        base_messages = list(pre_built_messages) if pre_built_messages else None
+        if base_messages and trade_feedback.strip():
+            base_messages.append({
+                "role": "user",
+                "content": "[TRADE_FEEDBACK]\n" + trade_feedback.strip() +
+                "\n[SYSTEM] Recent forced stop-loss or failed execution reduces risk appetite. Do not immediately replace a stopped position unless the setup is exceptional."
+            })
         final_decision = Decision(action="hold", reason="max rounds reached")
         use_tools = pre_built_messages is not None  # Enable function calling for v3 mode
 
@@ -82,8 +90,20 @@ class AgentRunner(IAgentRunner):
             start_time = time.time()
 
             # Build context
-            if pre_built_messages and round_num == 1:
-                messages = pre_built_messages
+            if base_messages and round_num == 1:
+                messages = base_messages
+            elif base_messages:
+                messages = list(base_messages)
+                if tool_history:
+                    messages.append({"role": "user", "content": "\n\n".join(tool_history)})
+
+                max_r = self._config.max_agent_rounds
+                if round_num >= max_r:
+                    instruction = self._context._loader.load_final_round_instruction()
+                else:
+                    instruction = self._context._loader.load_instruction_template()
+                    instruction = instruction.replace("{round_num}", str(round_num)).replace("{max_rounds}", str(max_r))
+                messages.append({"role": "user", "content": f"[ROUND] {round_num}/{max_r}\n{instruction}"})
             else:
                 messages = self._context.build(
                     timestamp, snapshot, market_data, stock_data,
@@ -113,6 +133,8 @@ class AgentRunner(IAgentRunner):
                     tool_results += "\n\n[SYSTEM] You have used 2 tool rounds. Further exploration is discouraged. Produce final JSON unless one specific required field is still missing."
                 elif round_num >= 3:
                     tool_results += "\n\n[SYSTEM] Tool exploration budget exhausted. Final JSON only. Reject any further tool calls."
+                if base_messages:
+                    tool_history.append(tool_results)
 
                 # Record round
                 decision = Decision(action="query", reason="tool calls")
@@ -130,22 +152,12 @@ class AgentRunner(IAgentRunner):
                 round_data._tool_records = tool_records  # Store for logging
                 rounds.append(round_data)
 
-                # Append tool results to messages for next round
-                if pre_built_messages:
-                    pre_built_messages = list(pre_built_messages)  # copy
-                    pre_built_messages.append({"role": "assistant", "content": response_text, "tool_calls": [
-                        {
-                            "id": tc.get("id", f"call_{i}"),
-                            "type": "function",
-                            "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}
-                        }
-                        for i, tc in enumerate(tool_calls)
-                    ]})
-                    pre_built_messages.append({"role": "tool", "tool_call_id": "all", "content": tool_results})
                 continue
+
 
             # Parse response
             decision = self._parse_decision(response_text)
+            decision = self._apply_trade_feedback_guards(decision, trade_feedback)
 
             round_data = AgentRound(
                 round_num=round_num,
@@ -187,6 +199,47 @@ class AgentRunner(IAgentRunner):
                 break
 
         return final_decision, rounds
+
+    @staticmethod
+    def _apply_trade_feedback_guards(decision: Decision, trade_feedback: str) -> Decision:
+        """Apply deterministic guards derived from just-executed trade feedback."""
+        if decision.action != "trade" or not decision.trades or "AUTO SELL" not in trade_feedback:
+            return decision
+
+        stopped_markets = {
+            market
+            for market in Market
+            if f"({market.value})" in trade_feedback
+        }
+        if not stopped_markets:
+            return decision
+
+        filtered_trades = [
+            trade for trade in decision.trades
+            if not (trade.side == OrderSide.BUY and trade.market in stopped_markets)
+        ]
+        removed = len(decision.trades) - len(filtered_trades)
+        if removed == 0:
+            return decision
+
+        reason = (
+            f"{decision.reason} | filtered {removed} same-market BUY(s) after auto stop-loss"
+        ).strip()
+        if not filtered_trades:
+            return Decision(
+                action="hold",
+                reason=reason,
+                memory_updates=decision.memory_updates,
+                plan_updates=decision.plan_updates,
+            )
+
+        return Decision(
+            action="trade",
+            trades=filtered_trades,
+            reason=reason,
+            memory_updates=decision.memory_updates,
+            plan_updates=decision.plan_updates,
+        )
 
     def _call_llm(self, messages: list[dict]) -> tuple[str, int, int, str]:
         """Call LLM and return (response_text, prompt_tokens, completion_tokens, reasoning_content)."""
@@ -344,6 +397,21 @@ class AgentRunner(IAgentRunner):
                 continue
 
             if trade.allocation_pct is not None:
+                # target_pct_nav=0 is the v3 "close position" signal.
+                # Resolve it to the full held quantity instead of a zero-share sell.
+                if trade.side.value == "sell" and trade.allocation_pct == 0:
+                    key = f"{trade.market.value}:{trade.symbol}"
+                    pos = snapshot.positions.get(key)
+                    if pos and pos.quantity > 0:
+                        resolved.append(TradeOrder(
+                            symbol=trade.symbol,
+                            market=trade.market,
+                            side=trade.side,
+                            quantity=pos.quantity,
+                            allocation_pct=trade.allocation_pct,
+                            reason=trade.reason,
+                        ))
+                        continue
                 # Cap allocation_pct at 25% (hard limit)
                 alloc = min(trade.allocation_pct, 0.25)
 

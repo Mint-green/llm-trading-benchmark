@@ -583,6 +583,16 @@ class Screener:
         cost_map = {"US": 1.0, "CN": 0.6, "HK": 0.2, "CRYPTO": 0.5}
         cost_efficiency = cost_map.get(s.market.value, 0.5)
 
+        # 10. RSI penalty: penalize stocks with RSI > 60 (overbought risk)
+        # RSI 30-55 is ideal (penalty=0), RSI 55-65 is acceptable (penalty=0.2), RSI > 65 is risky (penalty=0.5)
+        rsi_penalty = 0.0
+        if s.rsi > 65:
+            rsi_penalty = 0.5  # strong penalty for overbought
+        elif s.rsi > 60:
+            rsi_penalty = 0.2  # moderate penalty
+        elif s.rsi < 30:
+            rsi_penalty = 0.3  # penalty for deeply oversold (falling knife risk)
+
         composite = (
             0.19 * liquidity
             + 0.14 * momentum
@@ -592,6 +602,7 @@ class Screener:
             + 0.14 * market_activity
             + 0.05 * recency
             + 0.03 * cost_efficiency
+            - 0.10 * rsi_penalty  # RSI penalty
             # random 0.10 added during allocation
         )
 

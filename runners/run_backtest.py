@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--interval", type=int, default=None, help="Decision interval in minutes")
     parser.add_argument("--initial-cash", type=float, default=None, help="Initial cash amount")
     parser.add_argument("--max-decisions", type=int, default=None, help="Max decisions (0=unlimited)")
+    parser.add_argument("--max-rounds", type=int, default=None, help="Max LLM rounds per decision")
     parser.add_argument("--thinking", action="store_true", help="Enable thinking mode")
     parser.add_argument("--config", default="config/config.toml", help="Config file path")
     parser.add_argument("--output", default="output/results/benchmark.db", help="Output database path")
@@ -66,6 +67,8 @@ def main():
         overrides["initial_cash"] = args.initial_cash
     if args.max_decisions is not None:
         overrides["max_decisions"] = args.max_decisions
+    if args.max_rounds is not None:
+        overrides["max_agent_rounds"] = args.max_rounds
     if args.thinking:
         overrides["thinking_enabled"] = True
 
