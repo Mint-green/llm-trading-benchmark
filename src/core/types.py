@@ -19,6 +19,8 @@ class Market(str, Enum):
     HK = "HK"
     CN = "CN"
     CRYPTO = "CRYPTO"
+    GOLD = "GOLD"
+    FUTURES = "FUTURES"
 
 
 class OrderSide(str, Enum):
@@ -180,10 +182,18 @@ class TradeOrder:
     symbol: str
     market: Market
     side: OrderSide
-    quantity: int = 0            # shares/units (resolved from allocation_pct)
+    quantity: float = 0.0        # shares/units/contracts (resolved from allocation_pct)
     allocation_pct: float | None = None  # fraction of NAV (0.05 = 5%)
     reason: str = ""
     order_type: OrderType = OrderType.MARKET
+    asset_type: str = "equity"
+    action: str = ""                     # futures: OPEN_OR_INCREASE, REDUCE, CLOSE, HOLD
+    futures_side: str = ""               # futures: long, short, flat
+    target_notional_pct_nav: float | None = None
+    max_margin_pct_nav: float | None = None
+    risk_budget_pct_nav: float | None = None
+    unit_hint: dict[str, Any] = field(default_factory=dict)
+    risk_trigger: str = ""
 
 
 @dataclass
@@ -195,6 +205,7 @@ class TradeResult:
     cost: float = 0.0     # total cost (buy) or proceeds (sell)
     fees: float = 0.0
     error: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -202,8 +213,8 @@ class Position:
     """A held position."""
     symbol: str
     market: Market
-    quantity: int
-    avg_cost: float       # average cost per share in USD
+    quantity: float
+    avg_cost: float       # average cost per share/unit in USD
     current_price: float = 0.0
     unrealized_pnl: float = 0.0
 
@@ -222,6 +233,10 @@ class PortfolioSnapshot:
     market_exposure: dict[Market, float] # market -> exposure in USD
     fx_rates: dict[str, float]           # "USD/JPY" etc.
     frozen_keys: set[str] = field(default_factory=set)  # T+1 frozen (CN bought today)
+    futures_positions: dict[str, FuturesPosition] = field(default_factory=dict)
+    futures_margin_locked: float = 0.0
+    futures_margin_state: str = "OK"
+    futures_pnl_delta: float = 0.0
 
 
 # ============================================================
@@ -319,6 +334,16 @@ class CandidateInBucket:
     trend6: str = ""           # 6-bar trend pattern
     setup: str = ""            # setup classification
     recent_score: int = 0      # short-term state score (-2 to +2)
+    asset_type: str = "equity"
+    actual_contract: str = ""
+    notional_per_contract: float = 0.0
+    initial_margin: float = 0.0
+    maintenance_margin: float = 0.0
+    one_contract_notional_pct_nav: float = 0.0
+    one_contract_margin_pct_nav: float = 0.0
+    roll_status: str = ""
+    days_to_expiry: int = 0
+    liquidity_note: str = ""
 
 
 @dataclass
@@ -332,6 +357,7 @@ class CandidateBuckets:
     low_vol_defensive: list[CandidateInBucket]
     crypto_candidates: list[CandidateInBucket]
     blocked_or_warning: list[CandidateInBucket]
+    futures_macro: list[CandidateInBucket] = field(default_factory=list)
 
 
 # ============================================================
@@ -344,9 +370,104 @@ class PortfolioTarget:
     symbol: str
     asset_type: str = "equity"  # equity, crypto, gold_spot, oil_proxy, cash
     target_pct_nav: float = 0.0  # fraction of NAV (0.03 = 3%)
+    side: str = ""               # futures: long, short, flat
+    target_notional_pct_nav: float | None = None
+    max_margin_pct_nav: float | None = None
+    risk_budget_pct_nav: float | None = None
+    unit_hint: dict[str, Any] = field(default_factory=dict)
+    risk_trigger: str = ""
     priority: int = 1
     max_cost_bps: float = 35.0
     reason: str = ""
+
+
+# ============================================================
+# Futures system
+# ============================================================
+
+@dataclass(frozen=True)
+class FuturesContractSpec:
+    """Static and point-in-time metadata for an actual futures contract."""
+    root_symbol: str
+    continuous_symbol: str
+    contract_ticker: str
+    exchange: str = ""
+    currency: str = "USD"
+    multiplier: float = 1.0
+    tick_size: float = 0.01
+    tick_value: float = 0.01
+    initial_margin: float = 0.0
+    maintenance_margin: float = 0.0
+    expiry_date: str | None = None
+    first_notice_date: str | None = None
+    last_trade_date: str | None = None
+    roll_start_date: str | None = None
+    status: str | None = None
+    bars_count: int | None = None
+    date_range: str | None = None
+
+
+@dataclass(frozen=True)
+class FuturesResolvedContract:
+    """Resolver output for a continuous futures symbol at one timestamp."""
+    continuous_symbol: str
+    contract_ticker: str
+    timestamp: str
+    expiry_date: str | None = None
+    days_to_expiry: int | None = None
+    roll_status: str = "normal"
+    selection_method: str = ""
+    price: float | None = None
+    multiplier: float = 1.0
+    tick_size: float = 0.01
+    tick_value: float = 0.01
+    initial_margin: float = 0.0
+    maintenance_margin: float = 0.0
+    notional_per_contract: float | None = None
+    previous_session_dollar_volume: float | None = None
+    previous_session_volume: float | None = None
+
+
+@dataclass
+class FuturesPosition:
+    """Variation-margin futures position state."""
+    continuous_symbol: str
+    contract_ticker: str
+    side: str
+    contracts: int
+    avg_entry_price: float
+    previous_mark_price: float
+    current_price: float
+    multiplier: float
+    initial_margin_per_contract: float
+    maintenance_margin_per_contract: float
+    margin_locked: float
+    realized_pnl: float = 0.0
+    cumulative_variation_pnl: float = 0.0
+    opened_at: str = ""
+    updated_at: str = ""
+
+    @property
+    def side_sign(self) -> int:
+        return -1 if self.side == "short" else 1
+
+    @property
+    def notional(self) -> float:
+        return self.contracts * self.current_price * self.multiplier
+
+
+@dataclass
+class FuturesMarkResult:
+    """Mark-to-market result for one futures position."""
+    timestamp: str
+    continuous_symbol: str
+    contract_ticker: str
+    previous_mark_price: float
+    current_price: float
+    pnl_delta: float
+    cumulative_variation_pnl: float
+    margin_locked: float
+    margin_state: str
 
 
 # ============================================================

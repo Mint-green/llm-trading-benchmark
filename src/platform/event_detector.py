@@ -241,6 +241,18 @@ class EventDetector:
                 detail={"crypto_pct": crypto_pct, "max_pct": max_crypto},
             ))
 
+        # Futures margin state
+        if snapshot.futures_margin_state in ("WARNING", "BREACH"):
+            events.append(RiskEvent(
+                event_type="futures_margin_" + snapshot.futures_margin_state.lower(),
+                priority="P0" if snapshot.futures_margin_state == "BREACH" else "P1",
+                detail={
+                    "margin_state": snapshot.futures_margin_state,
+                    "margin_locked": snapshot.futures_margin_locked,
+                    "pnl_delta": snapshot.futures_pnl_delta,
+                },
+            ))
+
         # Regime change to RED
         if risk_mode == RiskMode.RED:
             events.append(RiskEvent(

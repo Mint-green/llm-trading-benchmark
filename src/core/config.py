@@ -76,6 +76,40 @@ class MarketCloseRuleConfig:
 
 
 @dataclass(frozen=True)
+class GoldConfig:
+    """Gold spot configuration using XAUUSD.FOREX from GOLD_stock.db."""
+    enabled: bool = True
+    allowed_symbols: tuple[str, ...] = ("XAUUSD.FOREX",)
+    ask_symbol: str = "XAUUSD.FOREX.ASK"
+    max_exposure_pct_nav: float = 0.25
+
+@dataclass(frozen=True)
+class FuturesConfig:
+    """Conservative futures configuration for the first GC.FUT implementation."""
+    enabled: bool = True
+    allowed_symbols: tuple[str, ...] = ("GC.FUT",)
+    allow_short: bool = False
+    max_contracts_per_symbol: int = 1
+    max_abs_notional_pct_nav: float = 0.50
+    max_total_abs_notional_pct_nav: float = 1.00
+    max_margin_pct_nav: float = 0.10
+    max_total_margin_pct_nav: float = 0.20
+    max_risk_budget_pct_nav: float = 0.01
+    roll_days_before_expiry: int = 5
+    force_close_days_before_expiry: int = 2
+    commission_per_contract: float = 2.50
+    slippage_bps: float = 2.0
+    min_dollar_volume_lookback: float = 0.0
+    liquidity_lookback_bars: int = 12
+    execution_price_mode: str = "next_bar_open"
+    gc_multiplier: float = 100.0
+    gc_tick_size: float = 0.1
+    gc_tick_value: float = 10.0
+    gc_initial_margin: float = 12000.0
+    gc_maintenance_margin: float = 11000.0
+
+
+@dataclass(frozen=True)
 class Config:
     """Benchmark configuration. Immutable after creation."""
 
@@ -93,6 +127,8 @@ class Config:
             Market.HK: os.path.join(self.stock_data_dir, "HK_stock.db").replace("\\", "/"),
             Market.CN: os.path.join(self.stock_data_dir, "A_stock.db").replace("\\", "/"),
             Market.CRYPTO: os.path.join(self.stock_data_dir, "CRYPTO_stock.db").replace("\\", "/"),
+            Market.GOLD: os.path.join(self.stock_data_dir, "GOLD_stock.db").replace("\\", "/"),
+            Market.FUTURES: os.path.join(self.stock_data_dir, "FUTURES_stock.db").replace("\\", "/"),
         }
 
     @property
@@ -102,6 +138,8 @@ class Config:
             Market.HK: "hk_5min",
             Market.CN: "stock_5min",
             Market.CRYPTO: "crypto_5min",
+            Market.GOLD: "gold_5min",
+            Market.FUTURES: "futures_5min",
         }
 
     # --- LLM Global Settings ---
@@ -137,6 +175,8 @@ class Config:
     decision_schedule: DecisionScheduleConfig = field(default_factory=DecisionScheduleConfig)
     tail_guard: TailGuardConfig = field(default_factory=TailGuardConfig)
     market_close_rule: MarketCloseRuleConfig = field(default_factory=MarketCloseRuleConfig)
+    futures: FuturesConfig = field(default_factory=FuturesConfig)
+    gold: GoldConfig = field(default_factory=GoldConfig)
 
     # --- Trigger Thresholds ---
     trigger_config: TriggerConfig = field(default_factory=TriggerConfig)
@@ -164,6 +204,8 @@ class Config:
             Market.HK: 5.0,
             Market.CN: 3.0,
             Market.CRYPTO: 10.0,
+            Market.GOLD: 0.0,
+            Market.FUTURES: 0.0,
         }
     )
     slippage_bps: dict[Market, float] = field(
@@ -172,6 +214,8 @@ class Config:
             Market.HK: 5.0,
             Market.CN: 5.0,
             Market.CRYPTO: 10.0,
+            Market.GOLD: 5.0,
+            Market.FUTURES: 2.0,
         }
     )
     cn_sell_tax_bps: float = 5.0
@@ -220,6 +264,8 @@ class Config:
             Market.HK: 50,
             Market.CN: 50,
             Market.CRYPTO: 18,
+            Market.GOLD: 1,
+            Market.FUTURES: 1,
         }
     )
 
@@ -248,6 +294,8 @@ class Config:
         schedule_cfg = data.get("decision_schedule", {})
         open_window_cfg = schedule_cfg.get("open_window", {})
         close_window_cfg = schedule_cfg.get("close_window", {})
+        futures_cfg = data.get("futures", {})
+        gold_cfg = data.get("gold", {})
 
         # Determine which API to use based on model name
         model_name = model_cfg.get("name", "mimo-v2.5-pro")
@@ -283,16 +331,49 @@ class Config:
                 Market.HK: costs_cfg.get("commission_bps", {}).get("HK", 5),
                 Market.CN: costs_cfg.get("commission_bps", {}).get("CN", 3),
                 Market.CRYPTO: costs_cfg.get("commission_bps", {}).get("CRYPTO", 10),
+                Market.GOLD: costs_cfg.get("commission_bps", {}).get("GOLD", 0),
+                Market.FUTURES: costs_cfg.get("commission_bps", {}).get("FUTURES", 0),
             },
             "slippage_bps": {
                 Market.US: costs_cfg.get("slippage_bps", {}).get("US", 5),
                 Market.HK: costs_cfg.get("slippage_bps", {}).get("HK", 5),
                 Market.CN: costs_cfg.get("slippage_bps", {}).get("CN", 5),
                 Market.CRYPTO: costs_cfg.get("slippage_bps", {}).get("CRYPTO", 10),
+                Market.GOLD: costs_cfg.get("slippage_bps", {}).get("GOLD", gold_cfg.get("slippage_bps", 5)),
+                Market.FUTURES: costs_cfg.get("slippage_bps", {}).get("FUTURES", futures_cfg.get("slippage_bps", 2)),
             },
             # Agent
             "max_agent_rounds": agent_cfg.get("max_rounds", 4),
             # Decision schedule
+            "gold": GoldConfig(
+                enabled=gold_cfg.get("enabled", True),
+                allowed_symbols=tuple(gold_cfg.get("allowed_symbols", ["XAUUSD.FOREX"])),
+                ask_symbol=gold_cfg.get("ask_symbol", "XAUUSD.FOREX.ASK"),
+                max_exposure_pct_nav=gold_cfg.get("max_exposure_pct_nav", 0.25),
+            ),
+            "futures": FuturesConfig(
+                enabled=futures_cfg.get("enabled", True),
+                allowed_symbols=tuple(futures_cfg.get("allowed_symbols", ["GC.FUT"])),
+                allow_short=futures_cfg.get("allow_short", False),
+                max_contracts_per_symbol=futures_cfg.get("max_contracts_per_symbol", 1),
+                max_abs_notional_pct_nav=futures_cfg.get("max_abs_notional_pct_nav", 0.50),
+                max_total_abs_notional_pct_nav=futures_cfg.get("max_total_abs_notional_pct_nav", 1.00),
+                max_margin_pct_nav=futures_cfg.get("max_margin_pct_nav", 0.10),
+                max_total_margin_pct_nav=futures_cfg.get("max_total_margin_pct_nav", 0.20),
+                max_risk_budget_pct_nav=futures_cfg.get("max_risk_budget_pct_nav", 0.01),
+                roll_days_before_expiry=futures_cfg.get("roll_days_before_expiry", 5),
+                force_close_days_before_expiry=futures_cfg.get("force_close_days_before_expiry", 2),
+                commission_per_contract=futures_cfg.get("commission_per_contract", 2.50),
+                slippage_bps=futures_cfg.get("slippage_bps", 2),
+                min_dollar_volume_lookback=futures_cfg.get("min_dollar_volume_lookback", 0),
+                liquidity_lookback_bars=futures_cfg.get("liquidity_lookback_bars", 12),
+                execution_price_mode=futures_cfg.get("execution_price_mode", "next_bar_open"),
+                gc_multiplier=futures_cfg.get("gc_multiplier", 100.0),
+                gc_tick_size=futures_cfg.get("gc_tick_size", 0.1),
+                gc_tick_value=futures_cfg.get("gc_tick_value", 10.0),
+                gc_initial_margin=futures_cfg.get("gc_initial_margin", 12000.0),
+                gc_maintenance_margin=futures_cfg.get("gc_maintenance_margin", 11000.0),
+            ),
             "decision_schedule": DecisionScheduleConfig(
                 normal_interval_minutes=schedule_cfg.get("normal_interval_minutes", 30),
                 open_window=OpenWindowConfig(
@@ -345,5 +426,18 @@ class Config:
                 "max_market": self.position_limits.max_market_exposure,
                 "max_crypto": self.position_limits.max_crypto_exposure,
                 "min_cash": self.position_limits.min_cash_ratio,
+            },
+            "gold": {
+                "enabled": self.gold.enabled,
+                "allowed_symbols": list(self.gold.allowed_symbols),
+                "ask_symbol": self.gold.ask_symbol,
+                "max_exposure_pct_nav": self.gold.max_exposure_pct_nav,
+            },
+            "futures": {
+                "enabled": self.futures.enabled,
+                "allowed_symbols": list(self.futures.allowed_symbols),
+                "max_contracts_per_symbol": self.futures.max_contracts_per_symbol,
+                "max_margin_pct_nav": self.futures.max_margin_pct_nav,
+                "max_abs_notional_pct_nav": self.futures.max_abs_notional_pct_nav,
             },
         }

@@ -15,10 +15,13 @@ All tools are read-only. Trade execution happens via final JSON output.
 
 from __future__ import annotations
 
+import json
+
 from src.core.types import Market, PortfolioSnapshot, IndicatorSnapshot
 from src.core.interfaces import IToolSystem
 from src.data.provider import MarketDataProvider
 from src.data.features import FeatureGenerator
+from src.data.futures_resolver import FuturesContractResolver
 
 
 # Tool schemas for function calling
@@ -33,7 +36,7 @@ TOOL_SCHEMAS = [
                 "properties": {
                     "market": {
                         "type": "string",
-                        "enum": ["US", "CN", "HK", "CRYPTO", "ALL"],
+                        "enum": ["US", "CN", "HK", "CRYPTO", "GOLD", "FUTURES", "ALL"],
                         "description": "Market to screen"
                     },
                     "bucket": {
@@ -164,7 +167,7 @@ TOOL_SCHEMAS = [
                         "type": "array",
                         "items": {
                             "type": "string",
-                            "enum": ["US", "CN", "HK", "CRYPTO"],
+                            "enum": ["US", "CN", "HK", "CRYPTO", "GOLD", "FUTURES"],
                         },
                         "description": "Markets to query"
                     },
@@ -195,7 +198,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "query_futures_contract",
-            "description": "Query current actual futures contract mapped from a continuous symbol. Read-only. (Reserved for future use)",
+            "description": "Query current actual futures contract mapped from a continuous symbol, including margin, notional, liquidity, and roll status. Read-only.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -204,7 +207,7 @@ TOOL_SCHEMAS = [
                         "type": "array",
                         "items": {
                             "type": "string",
-                            "enum": ["actual_contract", "price", "multiplier", "notional", "margin"],
+                            "enum": ["actual_contract", "price", "multiplier", "tick_size", "tick_value", "notional", "initial_margin", "maintenance_margin", "volume", "dollar_volume", "roll_status", "expiry_date", "days_to_expiry", "selection_method"],
                         },
                     },
                 },
@@ -227,6 +230,9 @@ class ToolSystem(IToolSystem):
         self._data = data_provider
         self._features = feature_gen
         self._get_snapshot = portfolio_snapshot_fn
+        self._futures_resolver = None
+        if hasattr(data_provider, "_config") and hasattr(data_provider, "load_futures_contracts"):
+            self._futures_resolver = FuturesContractResolver(data_provider._config, data_provider)
 
     def get_tool_descriptions(self) -> list[dict]:
         """Return tool schemas for function calling."""
@@ -249,9 +255,52 @@ class ToolSystem(IToolSystem):
         elif name == "query_fx":
             return self._query_fx(args, timestamp)
         elif name == "query_futures_contract":
-            return "(futures not available in current version)"
+            return self._query_futures_contract(args, timestamp)
         else:
             return f"Unknown tool: {name}"
+
+
+    def _query_futures_contract(self, args: dict, timestamp: str) -> str:
+        """Query point-in-time actual contract mapping and futures risk metadata."""
+        symbol = args.get("continuous_symbol", "GC.FUT")
+        fields = set(args.get("fields") or [])
+        if self._futures_resolver is None:
+            return "(futures not available in current version)"
+        resolved = self._futures_resolver.resolve(symbol, timestamp)
+        if not resolved.contract_ticker:
+            return json.dumps({
+                "continuous_symbol": symbol,
+                "timestamp": timestamp,
+                "status": resolved.roll_status,
+                "selection_method": resolved.selection_method,
+                "error": "no active futures contract",
+            }, ensure_ascii=False)
+
+        payload = {
+            "continuous_symbol": symbol,
+            "actual_contract": resolved.contract_ticker,
+            "timestamp": timestamp,
+            "price": resolved.price,
+            "multiplier": resolved.multiplier,
+            "tick_size": resolved.tick_size,
+            "tick_value": resolved.tick_value,
+            "notional_per_contract": resolved.notional_per_contract,
+            "initial_margin": resolved.initial_margin,
+            "maintenance_margin": resolved.maintenance_margin,
+            "previous_session_dollar_volume": resolved.previous_session_dollar_volume,
+            "previous_session_volume": resolved.previous_session_volume,
+            "roll_status": resolved.roll_status,
+            "expiry_date": resolved.expiry_date,
+            "days_to_expiry": resolved.days_to_expiry,
+            "selection_method": resolved.selection_method,
+        }
+        if fields:
+            aliases = {"notional": "notional_per_contract", "margin": "initial_margin", "volume": "previous_session_volume", "dollar_volume": "previous_session_dollar_volume"}
+            keep = {"continuous_symbol", "timestamp"}
+            for f in fields:
+                keep.add(aliases.get(f, f))
+            payload = {k: v for k, v in payload.items() if k in keep}
+        return json.dumps(payload, ensure_ascii=False)
 
     def _screen_universe(self, args: dict, timestamp: str) -> str:
         """Screen universe by market, bucket, filters."""
@@ -263,9 +312,9 @@ class ToolSystem(IToolSystem):
 
         # Determine markets to screen
         if market_str == "ALL":
-            markets = [Market.US, Market.HK, Market.CN, Market.CRYPTO]
+            markets = [Market.US, Market.HK, Market.CN, Market.CRYPTO, Market.GOLD]
         else:
-            market_map = {"US": Market.US, "HK": Market.HK, "CN": Market.CN, "CRYPTO": Market.CRYPTO}
+            market_map = {"US": Market.US, "HK": Market.HK, "CN": Market.CN, "CRYPTO": Market.CRYPTO, "GOLD": Market.GOLD, "FUTURES": Market.FUTURES}
             markets = [market_map.get(market_str, Market.US)]
 
         snapshot = self._get_snapshot()
@@ -432,7 +481,7 @@ class ToolSystem(IToolSystem):
             lines.append(f"  Tradable: yes")  # TODO: check AssetStatusProvider
 
         if "cost" in fields:
-            cost_map = {"US": "3+5 bps", "HK": "15-30 bps", "CN": "5-15 bps", "CRYPTO": "5-20 bps"}
+            cost_map = {"US": "3+5 bps", "HK": "15-30 bps", "CN": "5-15 bps", "CRYPTO": "5-20 bps", "GOLD": "~5 bps"}
             lines.append(f"  Est. cost: {cost_map.get(market.value, 'unknown')}")
 
         return "\n".join(lines)
@@ -528,11 +577,11 @@ class ToolSystem(IToolSystem):
 
     def _query_market_overview(self, args: dict, timestamp: str) -> str:
         """Query market overview."""
-        markets = args.get("markets", ["US", "HK", "CN", "CRYPTO"])
+        markets = args.get("markets", ["US", "HK", "CN", "CRYPTO", "GOLD"])
         include_regime = args.get("include_regime", True)
         include_breadth = args.get("include_breadth", True)
 
-        market_map = {"US": Market.US, "HK": Market.HK, "CN": Market.CN, "CRYPTO": Market.CRYPTO}
+        market_map = {"US": Market.US, "HK": Market.HK, "CN": Market.CN, "CRYPTO": Market.CRYPTO, "GOLD": Market.GOLD, "FUTURES": Market.FUTURES}
         snapshot = self._get_snapshot()
 
         lines = [f"[MARKET_OVERVIEW] @ {timestamp}"]
@@ -599,10 +648,14 @@ class ToolSystem(IToolSystem):
     @staticmethod
     def _ticker_to_market(ticker: str) -> Market | None:
         """Determine market from ticker suffix."""
+        if ticker == "XAUUSD.FOREX":
+            return Market.GOLD
         if ticker.endswith(".US"):
             return Market.US
         elif ticker.endswith(".HK"):
             return Market.HK
+        elif ticker.endswith(".FUT"):
+            return Market.FUTURES
         elif ticker.endswith(".CC") or "-" in ticker:
             return Market.CRYPTO
         elif ticker.startswith("sh.") or ticker.startswith("sz."):

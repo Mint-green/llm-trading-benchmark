@@ -460,6 +460,7 @@ class Screener:
             Market.HK: 40.0,   # higher fees + stamp
             Market.CN: 26.0,   # commission + tax
             Market.CRYPTO: 40.0,  # spread + slippage
+            Market.GOLD: 10.0,    # spot spread/slippage estimate
         }.get(market, 30.0)
 
     def _score_stock(

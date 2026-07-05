@@ -12,7 +12,7 @@ from typing import Any
 
 from src.core.config import Config
 from src.core.types import (
-    Market, OrderSide, PortfolioSnapshot, TradeOrder, Decision,
+    Market, OrderSide, PortfolioSnapshot, TradeOrder, TradeResult, Decision,
     AgentRound, BenchmarkResult, DecisionType, RiskMode,
 )
 from src.data.provider import MarketDataProvider
@@ -22,6 +22,8 @@ from src.data.asset_status import AssetStatusProvider
 from src.data.screener import Screener
 from src.data.fx_provider import FxProvider
 from src.data.index_provider import IndexProvider
+from src.data.futures_resolver import FuturesContractResolver
+from src.data.futures_candidates import FuturesCandidateBuilder
 from src.portfolio.nav import NavEngine
 from src.portfolio.constraints import ConstraintEngine
 from src.portfolio.market_rules import MarketRuleEngine
@@ -29,6 +31,7 @@ from src.portfolio.execution import ExecutionEngine
 from src.portfolio.settlement import SettlementEngine
 from src.portfolio.portfolio import PortfolioEngine
 from src.portfolio.trigger_engine import TriggerEngine
+from src.portfolio.futures import FuturesAccount
 from src.agent.context import ContextBuilder
 from src.agent.tools import ToolSystem
 from src.agent.runner import AgentRunner
@@ -61,6 +64,8 @@ class ExperimentRunner:
         forex_db = os.path.join(self.config.stock_data_dir, "FOREX_stock.db")
         self.fx_provider = FxProvider(db_path=forex_db)
         self.index_provider = IndexProvider(data_dir=self.config.stock_data_dir)
+        self.futures_resolver = FuturesContractResolver(self.config, self.data_provider)
+        self.futures_candidates = FuturesCandidateBuilder(self.data_provider, self.features, self.futures_resolver)
 
         # Portfolio layer
         self.nav_engine = NavEngine(self.config.fx_rates)
@@ -72,6 +77,7 @@ class ExperimentRunner:
             self.config, self.nav_engine, self.constraints,
             self.execution, self.settlement, self.market_rules,
         )
+        self.futures_account = FuturesAccount(self.config, self.data_provider, self.futures_resolver, self.portfolio.get_cash("USD"))
 
         # Trigger engine
         self.trigger_engine = TriggerEngine(
@@ -120,6 +126,8 @@ class ExperimentRunner:
         self._risk_mode = RiskMode.GREEN
         self._stop_loss_buy_pause_until: dict[Market, str] = {}
         self._pending_daily_summary_injection = False
+        self._logged_futures_roll_count = 0
+        self._logged_futures_trade_count = 0
 
     def run(self) -> BenchmarkResult:
         """Run the complete benchmark."""
@@ -146,7 +154,10 @@ class ExperimentRunner:
 
         print(f"Loading market data (warmup from {warmup_start})...")
         all_bars: dict[Market, dict[str, list]] = {}
-        for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO]:
+        markets_to_load = [Market.US, Market.HK, Market.CN, Market.CRYPTO]
+        if self.config.gold.enabled:
+            markets_to_load.append(Market.GOLD)
+        for market in markets_to_load:
             all_bars[market] = self.data_provider.load_all_bars(
                 market, warmup_start, self.config.backtest_end,
             )
@@ -198,6 +209,33 @@ class ExperimentRunner:
             self._update_prices(ts, all_bars)
             _t_prices += _time.time() - _t0
 
+            # Futures variation margin mark-to-market before snapshot/context.
+            futures_pnl_delta = 0.0
+            if self.futures_account.positions:
+                self.futures_account.cash_usd = self.portfolio.get_cash("USD")
+                marks = self.futures_account.mark_to_market(ts)
+                futures_pnl_delta = sum(m.pnl_delta for m in marks)
+                for mark in marks:
+                    self.logger.log_futures_mark(mark, self.futures_account.cash_usd)
+                new_futures_trades = self._log_new_futures_account_trades(ts)
+                forced = [t for t in new_futures_trades if t.metadata.get("forced_liquidation")]
+                if forced:
+                    self.memory.record_risk_change(
+                        "futures_forced_liquidation: " + ", ".join(t.order.symbol for t in forced),
+                        ts,
+                    )
+                new_rolls = self.futures_account.roll_history[self._logged_futures_roll_count:]
+                for roll_event in new_rolls:
+                    self.logger.log_futures_roll_event(roll_event)
+                self._logged_futures_roll_count = len(self.futures_account.roll_history)
+                self.portfolio.sync_futures_state(
+                    self.futures_account.cash_usd,
+                    self.futures_account.positions,
+                    self.futures_account.margin_locked,
+                    self.futures_account.margin_state,
+                    futures_pnl_delta,
+                )
+
             # Snapshot (with real FX rates)
             _t0 = _time.time()
             snapshot = self.portfolio.get_snapshot(ts)
@@ -225,7 +263,7 @@ class ExperimentRunner:
                     nav_start=daily_start_nav,
                     nav_end=nav_end,
                     all_decisions=daily_decisions,
-                    all_trades=list(self.portfolio.trade_history),
+                    all_trades=self._all_trade_history(),
                     session_summaries=daily_session_summaries,
                     snapshot=snapshot,
                     plans=[],
@@ -262,16 +300,17 @@ class ExperimentRunner:
 
             # Quick scheduler pre-check (no event detection)
             has_stock_market = any(m in open_markets for m in [Market.US, Market.HK, Market.CN])
-            has_crypto_position = any(
-                pos.market == Market.CRYPTO for pos in snapshot.positions.values()
+            has_24h_spot_position = any(
+                pos.market in (Market.CRYPTO, Market.GOLD) for pos in snapshot.positions.values()
             )
+            has_24h_position = has_24h_spot_position or bool(snapshot.futures_positions)
             might_need_decision = has_stock_market and self.scheduler.needs_decision(ts, open_markets)
             _t_sched += _time.time() - _t0
 
             # Crypto-only period: schedule light_decision at lower frequency
             if not has_stock_market:
                 # Check if it's time for a light_decision.
-                light_interval = 60 if has_crypto_position else 240  # 1h or 4h
+                light_interval = 60 if has_24h_position else 240  # 1h or 4h
                 if self._is_light_decision_boundary(ts, light_interval):
                     if not self._last_light_decision or \
                        self.scheduler._minutes_since(ts, self._last_light_decision) >= light_interval:
@@ -386,13 +425,17 @@ class ExperimentRunner:
                 # Only screen crypto market
                 buckets = self.screener.screen_into_buckets(
                     all_bars, ts, held_positions=held_info,
-                    open_markets=[Market.CRYPTO],
+                    open_markets=[Market.CRYPTO, Market.GOLD],
                 )
+                if self.config.futures.enabled:
+                    buckets.futures_macro = self.futures_candidates.build(
+                        ts, snapshot.total_nav, list(self.config.futures.allowed_symbols),
+                    )
 
                 # Build crypto-only market summary
                 market_summary = ContextBuilder.build_market_summary_from_universe(
                     all_bars, self.features, ts, index_returns=index_returns,
-                    open_markets=[Market.CRYPTO],
+                    open_markets=[Market.CRYPTO, Market.GOLD],
                 )
 
                 memory_state = self.memory.get_memory_state(
@@ -407,7 +450,7 @@ class ExperimentRunner:
                     buckets=buckets,
                     memory_state=memory_state,
                     risk_mode=self._risk_mode,
-                    open_markets=["CRYPTO"],
+                    open_markets=[m.value for m in open_markets if m in (Market.CRYPTO, Market.GOLD, Market.FUTURES)],
                     closed_markets=["US", "HK", "CN"],
                     benchmark_day=0,
                     bar_index=i,
@@ -441,6 +484,10 @@ class ExperimentRunner:
                     all_bars, ts, held_positions=held_info, exit_watch_positions=exit_info,
                     open_markets=open_markets,
                 )
+                if self.config.futures.enabled:
+                    buckets.futures_macro = self.futures_candidates.build(
+                        ts, snapshot.total_nav, list(self.config.futures.allowed_symbols),
+                    )
 
                 market_summary = ContextBuilder.build_market_summary_from_universe(
                     all_bars, self.features, ts, index_returns=index_returns,
@@ -471,6 +518,7 @@ class ExperimentRunner:
                     Market.HK: self.universe.get_symbols(Market.HK),
                     Market.CN: self.universe.get_symbols(Market.CN),
                     Market.CRYPTO: self.universe.get_symbols(Market.CRYPTO),
+                    Market.GOLD: self.universe.get_symbols(Market.GOLD),
                 }
                 universe_str = ContextBuilder.build_universe_layer(universe_dict)
 
@@ -530,7 +578,7 @@ class ExperimentRunner:
                 _t_llm += _time.time() - _t_llm_start
                 if decision_request.decision_type == DecisionType.LIGHT_DECISION:
                     decision = self._restrict_light_decision_trades(
-                        decision, allow_new_crypto_buys=has_crypto_position,
+                        decision, allow_new_24h_buys=has_24h_position,
                     )
                 decision = self._filter_stop_loss_cooldown_buys(decision, ts)
                 all_rounds.extend(rounds)
@@ -564,6 +612,37 @@ class ExperimentRunner:
                     has_failures = False
                     for trade in decision.trades:
                         requested_qty = trade.quantity
+                        if trade.market == Market.FUTURES or trade.asset_type == "futures":
+                            self.futures_account.cash_usd = self.portfolio.get_cash("USD")
+                            result = self.futures_account.process_order(trade, ts)
+                            self.portfolio.sync_futures_state(
+                                self.futures_account.cash_usd,
+                                self.futures_account.positions,
+                                self.futures_account.margin_locked,
+                                self.futures_account.margin_state,
+                            )
+                            self._log_new_futures_account_trades(ts)
+                            if result.success:
+                                executed_qty = result.order.quantity
+                                feedback_results.append({
+                                    "type": "ok",
+                                    "symbol": trade.symbol,
+                                    "market": trade.market.value,
+                                    "side": trade.side.value,
+                                    "quantity": executed_qty,
+                                })
+                            else:
+                                has_failures = True
+                                feedback_results.append({
+                                    "type": "failed",
+                                    "symbol": trade.symbol,
+                                    "market": trade.market.value,
+                                    "side": trade.side.value,
+                                    "quantity": trade.quantity,
+                                    "error": result.error,
+                                })
+                            continue
+
                         price = self._get_price(trade.symbol, trade.market, ts, all_bars)
                         if price:
                             result = self.portfolio.process_order(trade, price, ts)
@@ -685,8 +764,9 @@ class ExperimentRunner:
             )
 
             # Update progress in database (every decision)
-            total_trades = len(self.portfolio.trade_history)
-            successful_trades = sum(1 for t in self.portfolio.trade_history if t.success)
+            combined_trades = self._all_trade_history()
+            total_trades = len(combined_trades)
+            successful_trades = sum(1 for t in combined_trades if t.success)
             self.logger.update_progress(
                 last_decision_ts=ts,
                 decisions_made=decision_count,
@@ -710,7 +790,7 @@ class ExperimentRunner:
                 nav_start=daily_start_nav,
                 nav_end=nav_end,
                 all_decisions=daily_decisions,
-                all_trades=list(self.portfolio.trade_history),
+                all_trades=self._all_trade_history(),
                 session_summaries=daily_session_summaries,
                 snapshot=self.portfolio.get_snapshot(timestamps[-1] if timestamps else ""),
                 plans=[],
@@ -743,7 +823,7 @@ class ExperimentRunner:
             portfolio_history = [final_snapshot]
 
         # Compute results
-        trades = self.portfolio.trade_history
+        trades = self._all_trade_history()
         metrics = self.metrics.compute(portfolio_history, trades)
         behavior = self.behavior.analyze(all_rounds, trades)
 
@@ -792,9 +872,23 @@ class ExperimentRunner:
 
         return result
 
+    def _all_trade_history(self) -> list[TradeResult]:
+        """Return execution history across spot/stock portfolio and futures account."""
+        futures_trades = getattr(self, "futures_account", None)
+        return list(self.portfolio.trade_history) + (list(futures_trades.trade_history) if futures_trades else [])
+
+    def _log_new_futures_account_trades(self, timestamp: str) -> list[TradeResult]:
+        """Persist futures trades created inside FuturesAccount exactly once."""
+        start = getattr(self, "_logged_futures_trade_count", 0)
+        new_trades = self.futures_account.trade_history[start:]
+        for result in new_trades:
+            self.logger.log_trade(result, timestamp)
+        self._logged_futures_trade_count = len(self.futures_account.trade_history)
+        return list(new_trades)
+
     def _any_market_open(self, ts: str) -> bool:
-        for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO]:
-            if market == Market.CRYPTO:
+        for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO, Market.GOLD, Market.FUTURES]:
+            if market in (Market.CRYPTO, Market.GOLD, Market.FUTURES):
                 return True  # always open
             ok, _ = self.asset_status.get_status(market, "", ts)
             if ok:
@@ -850,7 +944,7 @@ class ExperimentRunner:
     def _build_stock_data(self, ts: str, all_bars: dict) -> str:
         """Build compact card format stock data."""
         lines = ["[STOCK_DATA]"]
-        for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO]:
+        for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO, Market.GOLD]:
             symbols = self.universe.get_symbols(market)
             for sym in symbols[:5]:  # top 5 per market for now
                 bars = all_bars.get(market, {}).get(sym, [])
@@ -892,7 +986,7 @@ class ExperimentRunner:
 
     def _build_market_overview(self, ts: str, all_bars: dict) -> str:
         lines = []
-        for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO]:
+        for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO, Market.GOLD]:
             n = len(all_bars.get(market, {}))
             lines.append(f"{market.value}: {n} stocks")
         return "\n".join(lines)
@@ -910,6 +1004,8 @@ class ExperimentRunner:
         """Return True once after a daily summary is saved for prompt injection."""
         pending = getattr(self, "_pending_daily_summary_injection", False)
         self._pending_daily_summary_injection = False
+        self._logged_futures_roll_count = 0
+        self._logged_futures_trade_count = 0
         return pending
 
     @staticmethod
@@ -1055,13 +1151,15 @@ class ExperimentRunner:
 
     @staticmethod
     def _restrict_light_decision_trades(
-        decision: Decision, allow_new_crypto_buys: bool,
+        decision: Decision, allow_new_24h_buys: bool | None = None, allow_new_crypto_buys: bool | None = None,
     ) -> Decision:
         """Hard-limit light decisions to 24h risk management.
 
-        Without an existing crypto position, light decisions should not open new
+        Without an existing 24h position, light decisions should not open new
         24h exposure; they are low-frequency checks, not a separate alpha engine.
         """
+        if allow_new_24h_buys is None:
+            allow_new_24h_buys = bool(allow_new_crypto_buys)
         if decision.action != "trade" or not decision.trades:
             return decision
 
@@ -1069,10 +1167,10 @@ class ExperimentRunner:
         removed_scope = 0
         removed_new_buy = 0
         for trade in decision.trades:
-            if trade.market != Market.CRYPTO:
+            if trade.market not in (Market.CRYPTO, Market.GOLD, Market.FUTURES):
                 removed_scope += 1
                 continue
-            if trade.side == OrderSide.BUY and not allow_new_crypto_buys:
+            if trade.side == OrderSide.BUY and not allow_new_24h_buys:
                 removed_new_buy += 1
                 continue
             allowed_trades.append(trade)
@@ -1084,7 +1182,7 @@ class ExperimentRunner:
         if removed_scope:
             filters.append(f"filtered {removed_scope} out-of-scope trade(s) for light_decision")
         if removed_new_buy:
-            filters.append(f"filtered {removed_new_buy} new crypto BUY(s) without existing 24h position")
+            filters.append(f"filtered {removed_new_buy} new crypto BUY(s) / 24h-asset BUY(s) without existing 24h position")
         reason = f"{decision.reason} | {'; '.join(filters)}"
 
         if not allowed_trades:
@@ -1150,4 +1248,4 @@ class ExperimentRunner:
 
     @staticmethod
     def _market_currency(market: Market) -> str:
-        return {Market.US: "USD", Market.HK: "HKD", Market.CN: "CNY", Market.CRYPTO: "USD"}.get(market, "USD")
+        return {Market.US: "USD", Market.HK: "HKD", Market.CN: "CNY", Market.CRYPTO: "USD", Market.GOLD: "USD", Market.FUTURES: "USD"}.get(market, "USD")

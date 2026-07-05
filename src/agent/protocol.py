@@ -144,8 +144,38 @@ class DecisionProtocol:
             if market is None:
                 continue
 
-            target_pct = t.get("target_pct_nav", 0)
+            asset_type = t.get("asset_type", "equity")
             reason = t.get("reason", "")
+
+            if market == Market.FUTURES or asset_type == "futures":
+                fut_side = (t.get("side") or "long").lower()
+                target_notional = t.get("target_notional_pct_nav")
+                action = t.get("action", "")
+                if fut_side == "flat" or not target_notional or target_notional <= 0:
+                    side = OrderSide.SELL
+                    action = action or "CLOSE"
+                else:
+                    side = OrderSide.BUY
+                    action = action or "OPEN_OR_INCREASE"
+                trades.append(TradeOrder(
+                    symbol=symbol,
+                    market=Market.FUTURES,
+                    side=side,
+                    quantity=0,
+                    allocation_pct=None,
+                    reason=reason,
+                    asset_type="futures",
+                    action=action,
+                    futures_side=fut_side,
+                    target_notional_pct_nav=target_notional,
+                    max_margin_pct_nav=t.get("max_margin_pct_nav"),
+                    risk_budget_pct_nav=t.get("risk_budget_pct_nav"),
+                    unit_hint=t.get("unit_hint", {}),
+                    risk_trigger=t.get("risk_trigger", ""),
+                ))
+                continue
+
+            target_pct = t.get("target_pct_nav", 0)
 
             # Determine side from target_pct
             # Positive = buy, zero/negative = sell
@@ -163,6 +193,7 @@ class DecisionProtocol:
                 quantity=0,  # will be resolved later
                 allocation_pct=allocation_pct,
                 reason=reason,
+                asset_type=asset_type,
             ))
 
         return trades
@@ -225,10 +256,14 @@ class DecisionProtocol:
 
     @staticmethod
     def _ticker_to_market(ticker: str) -> Market | None:
+        if ticker == "XAUUSD.FOREX":
+            return Market.GOLD
         if ticker.endswith(".US"):
             return Market.US
         elif ticker.endswith(".HK"):
             return Market.HK
+        elif ticker.endswith(".FUT"):
+            return Market.FUTURES
         elif ticker.endswith(".CC") or "-" in ticker:
             return Market.CRYPTO
         elif ticker.startswith("sh.") or ticker.startswith("sz."):

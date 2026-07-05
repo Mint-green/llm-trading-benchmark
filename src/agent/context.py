@@ -338,7 +338,7 @@ class ContextBuilder(IContextBuilder):
     ) -> str:
         """Build Layer 1: Universe list (ticker + market only)."""
         lines = ["[UNIVERSE] All investable stocks (use query_stock for details):"]
-        for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO]:
+        for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO, Market.GOLD]:
             tickers = universe.get(market, [])
             if tickers:
                 display = ", ".join(tickers)
@@ -486,6 +486,8 @@ US: Currency=USD; Settlement=T+0; Lot=1 share min; No price limits; Halted/delis
 HK: Currency=HKD; Settlement=T+0; Variable lots; Lot rounding auto; No price limits; Halted non-tradable.
 CN: Currency=CNY; Buy=T+0; Sell=T+1; Lot=100; Price limit ±10% (STAR ±20%); Halted/limit-locked non-tradable.
 Crypto: Currency=USD; 24/7; Fractional ok; Max exposure=25% NAV.
+Gold: Currency=USD; spot XAUUSD.FOREX only; fractional ounces; use target_pct_nav, not futures fields; max 25% NAV.
+Futures: Currency=USD; contracts only; use target_notional_pct_nav, max_margin_pct_nav, risk_budget_pct_nav; query_futures_contract before opening/increasing.
 Global: Multi-currency accounts; Auto FX if balance insufficient; Local currency consumed first; Violations reject orders.
 
 [TRADING_COSTS] All prices include costs and slippage.
@@ -493,6 +495,8 @@ US: ~0.02%/trade commission, low slippage
 HK: ~0.15%-0.30% (commission + fees + stamp), variable lots add cost
 CN: ~0.05%-0.15% (commission + taxes), sell costs higher
 Crypto: ~0.05%-0.20% (spread + slippage), liquidity dependent
+Gold: ~0.05% slippage/spread estimate
+Futures: commission per contract + slippage; margin is locked performance bond, not purchase cost
 FX: ~0.10%-0.30% per conversion
 Avoid trades where expected edge < transaction costs."""
 
@@ -514,6 +518,8 @@ Avoid trades where expected edge < transaction costs."""
         else:
             closed_list.append("US")
         open_list.append("CRYPTO")
+        open_list.append("GOLD")
+        open_list.append("FUTURES")
         result = "OPEN: " + ", ".join(open_list)
         if closed_list:
             result += " | CLOSED: " + ", ".join(closed_list) + " (DO NOT trade these)"
@@ -536,7 +542,7 @@ Avoid trades where expected edge < transaction costs."""
             open_markets: list of open markets
         """
         if open_markets is None:
-            open_markets = [Market.US, Market.HK, Market.CN, Market.CRYPTO]
+            open_markets = [Market.US, Market.HK, Market.CN, Market.CRYPTO, Market.GOLD]
 
         open_market_set = set(open_markets)
         index_defaults = {
@@ -544,12 +550,13 @@ Avoid trades where expected edge < transaction costs."""
             Market.HK: "HSI",
             Market.CN: "SSE50",
             Market.CRYPTO: "BTC",
+            Market.GOLD: "XAU",
         }
 
         lines = ["[MARKET_SUMMARY]"]
         lines.append("Market|Open|TradeAllowed|Universe1H|Universe1D|Breadth|Vol")
 
-        for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO]:
+        for market in [Market.US, Market.HK, Market.CN, Market.CRYPTO, Market.GOLD]:
             market_bars = all_bars.get(market, {})
             is_open = market in open_market_set
             open_str = "yes" if is_open else "no"
@@ -799,6 +806,10 @@ Avoid trades where expected edge < transaction costs."""
         fmt_bucket("crypto_candidates", buckets.crypto_candidates,
                    "symbol|price|score|1d|rsi|rsi_d1h|ret_30m|trend6|setup|recent_score|risk")
 
+        # futures_macro
+        fmt_bucket("futures_macro", buckets.futures_macro,
+                   "symbol|actual_contract|price|trend|1h|1d|atr_pct|notional_per_contract|initial_margin|maintenance_margin|one_contract_notional_pct_nav|one_contract_margin_pct_nav|roll_status|days_to_expiry|risk")
+
         # blocked_or_warning
         fmt_bucket("blocked_or_warning", buckets.blocked_or_warning,
                    "symbol|mkt|reason|action")
@@ -856,6 +867,13 @@ Avoid trades where expected edge < transaction costs."""
             return (f"{c.ticker}|{c.price:.2f}|{c.score:.2f}|"
                     f"{c.chg_1d:+.1f}|{c.rsi:.0f}|{trend_vars}|{risk}")
 
+        if bucket_name == "futures_macro":
+            return (f"{c.ticker}|{c.actual_contract}|{c.price:.2f}|{c.trend}|"
+                    f"{c.chg_1h:+.2f}|{c.chg_1d:+.2f}|{c.atr_pct:.2f}|"
+                    f"{c.notional_per_contract:.0f}|{c.initial_margin:.0f}|{c.maintenance_margin:.0f}|"
+                    f"{c.one_contract_notional_pct_nav * 100:.1f}%|{c.one_contract_margin_pct_nav * 100:.1f}%|"
+                    f"{c.roll_status}|{c.days_to_expiry}|{c.risk_note or c.liquidity_note}")
+
         if bucket_name == "blocked_or_warning":
             return f"{c.ticker}|{c.market.value}|{c.reason}|{c.allowed_action}"
 
@@ -909,6 +927,8 @@ Avoid trades where expected edge < transaction costs."""
             lines.append(f"{market}|open|{minutes_to_close}|{minutes_to_tail}|{note}")
 
         lines.append("CRYPTO|open|N/A|N/A|always_open")
+        lines.append("GOLD|open|N/A|N/A|spot_data_driven")
+        lines.append("FUTURES|open|N/A|N/A|contract_data_driven")
         return "\n".join(lines)
 
     def _format_decision_context(
@@ -926,5 +946,6 @@ Avoid trades where expected edge < transaction costs."""
         lines.append(f'closed_markets: {closed_markets}')
         if decision_type == "light_decision":
             lines.append("scope: 24h_assets_only")
-            lines.append("allowed_trade_markets: ['CRYPTO']")
+            lines.append("allowed_trade_markets: ['CRYPTO', 'GOLD', 'FUTURES']")
+            lines.append("light_decision_rule: risk-manage existing 24h positions; open new 24h exposure only if already allowed by system state and setup is exceptional")
         return "\n".join(lines)

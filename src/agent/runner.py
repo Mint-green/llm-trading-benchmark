@@ -501,6 +501,14 @@ class AgentRunner(IAgentRunner):
                             quantity=min(trade.quantity, pos.quantity),
                             allocation_pct=trade.allocation_pct,
                             reason=trade.reason,
+                            asset_type=trade.asset_type,
+                            action=trade.action,
+                            futures_side=trade.futures_side,
+                            target_notional_pct_nav=trade.target_notional_pct_nav,
+                            max_margin_pct_nav=trade.max_margin_pct_nav,
+                            risk_budget_pct_nav=trade.risk_budget_pct_nav,
+                            unit_hint=trade.unit_hint,
+                            risk_trigger=trade.risk_trigger,
                         )
                 resolved.append(trade)
                 continue
@@ -519,6 +527,14 @@ class AgentRunner(IAgentRunner):
                             quantity=pos.quantity,
                             allocation_pct=trade.allocation_pct,
                             reason=trade.reason,
+                            asset_type=trade.asset_type,
+                            action=trade.action,
+                            futures_side=trade.futures_side,
+                            target_notional_pct_nav=trade.target_notional_pct_nav,
+                            max_margin_pct_nav=trade.max_margin_pct_nav,
+                            risk_budget_pct_nav=trade.risk_budget_pct_nav,
+                            unit_hint=trade.unit_hint,
+                            risk_trigger=trade.risk_trigger,
                         ))
                         continue
                 # Cap allocation_pct at 25% (hard limit)
@@ -533,7 +549,10 @@ class AgentRunner(IAgentRunner):
                     from src.portfolio.portfolio import MARKET_CURRENCY
                     currency = MARKET_CURRENCY.get(trade.market, "USD")
                     local_amount = self._portfolio._nav.convert_from_usd(usd_amount, currency)
-                    quantity = int(local_amount / price)
+                    if trade.market in (Market.CRYPTO, Market.GOLD):
+                        quantity = round(local_amount / price, 8)
+                    else:
+                        quantity = int(local_amount / price)
 
                     # Cap sell at held quantity
                     if trade.side.value == "sell":
@@ -550,6 +569,14 @@ class AgentRunner(IAgentRunner):
                             quantity=quantity,
                             allocation_pct=alloc,
                             reason=trade.reason,
+                            asset_type=trade.asset_type,
+                            action=trade.action,
+                            futures_side=trade.futures_side,
+                            target_notional_pct_nav=trade.target_notional_pct_nav,
+                            max_margin_pct_nav=trade.max_margin_pct_nav,
+                            risk_budget_pct_nav=trade.risk_budget_pct_nav,
+                            unit_hint=trade.unit_hint,
+                            risk_trigger=trade.risk_trigger,
                         ))
                         continue
 

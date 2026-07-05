@@ -357,12 +357,16 @@ class DecisionScheduler:
                     if not self._in_lunch_break(time_part, market):
                         open_markets.append(market)
 
-        # Crypto always open
+        # 24h/data-driven markets stay available outside stock sessions.
         open_markets.append(Market.CRYPTO)
+        if self._config.gold.enabled:
+            open_markets.append(Market.GOLD)
+        if self._config.futures.enabled:
+            open_markets.append(Market.FUTURES)
 
         return open_markets
 
     def get_closed_markets(self, timestamp: str) -> list[Market]:
         """Get list of closed markets at this timestamp."""
         open_markets = set(self.get_open_markets(timestamp))
-        return [m for m in [Market.US, Market.HK, Market.CN, Market.CRYPTO] if m not in open_markets]
+        return [m for m in [Market.US, Market.HK, Market.CN, Market.CRYPTO, Market.GOLD, Market.FUTURES] if m not in open_markets]

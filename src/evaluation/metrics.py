@@ -84,6 +84,21 @@ class MetricsEngine(IMetricsEngine):
         # Fees and slippage
         total_fees = sum(t.fees for t in successful_trades)
 
+        futures_trades = [t for t in trades if t.order.market == Market.FUTURES]
+        successful_futures = [t for t in successful_trades if t.order.market == Market.FUTURES]
+        gold_trades = [t for t in trades if t.order.market == Market.GOLD]
+        successful_gold = [t for t in successful_trades if t.order.market == Market.GOLD]
+        max_futures_margin_pct = max(
+            (s.futures_margin_locked / s.total_nav for s in portfolio_history if s.total_nav > 0),
+            default=0.0,
+        )
+        futures_warning_count = sum(1 for s in portfolio_history if s.futures_margin_state == "WARNING")
+        futures_breach_count = sum(1 for s in portfolio_history if s.futures_margin_state == "BREACH")
+        futures_mark_pnl_sum = sum(s.futures_pnl_delta for s in portfolio_history)
+        futures_close_pnl_sum = sum(float(t.metadata.get("pnl_delta", 0.0) or 0.0) for t in successful_futures)
+        futures_pnl_delta_sum = futures_mark_pnl_sum + futures_close_pnl_sum
+        futures_roll_trades = sum(1 for t in successful_futures if t.metadata.get("roll_trade"))
+
         # PnL attribution by market
         pnl_by_market = self._compute_pnl_by_market(portfolio_history, successful_trades)
 
@@ -107,6 +122,20 @@ class MetricsEngine(IMetricsEngine):
             "total_return_usd": round(final_nav - initial_nav, 2),
             # Efficiency
             "total_fees_usd": round(total_fees, 2),
+            "futures_trades": len(successful_futures),
+            "futures_rejected_orders": sum(1 for t in futures_trades if not t.success),
+            "futures_roll_trades": futures_roll_trades,
+            "futures_fees_usd": round(sum(t.fees for t in successful_futures), 2),
+            "max_futures_margin_pct_nav": round(max_futures_margin_pct * 100, 4),
+            "futures_margin_warning_count": futures_warning_count,
+            "futures_margin_breach_count": futures_breach_count,
+            "futures_mark_pnl_usd": round(futures_mark_pnl_sum, 2),
+            "futures_close_pnl_usd": round(futures_close_pnl_sum, 2),
+            "futures_pnl_delta_usd": round(futures_pnl_delta_sum, 2),
+            "futures_pnl_contribution_pct_nav": round((futures_pnl_delta_sum / initial_nav) * 100, 4) if initial_nav > 0 else 0.0,
+            "gold_trades": len(successful_gold),
+            "gold_rejected_orders": sum(1 for t in gold_trades if not t.success),
+            "gold_fees_usd": round(sum(t.fees for t in successful_gold), 2),
         }
 
     def compute_behavior_metrics(
@@ -206,6 +235,11 @@ class MetricsEngine(IMetricsEngine):
             "by_market": {k: round(v, 2) for k, v in by_market.items()},
             "by_symbol": {k: round(v, 2) for k, v in sorted(by_symbol.items(), key=lambda x: x[1], reverse=True)[:10]},
             "fees_slippage_usd": round(fees_total, 2),
+            "futures_variation_pnl_usd": round(
+                sum(s.futures_pnl_delta for s in portfolio_history) +
+                sum(float(t.metadata.get("pnl_delta", 0.0) or 0.0) for t in successful if t.order.market == Market.FUTURES),
+                2,
+            ),
         }
 
     @staticmethod
@@ -271,4 +305,10 @@ class MetricsEngine(IMetricsEngine):
             "total_return", "sharpe_ratio", "sortino_ratio", "max_drawdown",
             "volatility", "total_trades", "buy_trades", "sell_trades",
             "win_rate", "turnover", "initial_nav", "final_nav", "total_return_usd",
+            "futures_trades", "futures_rejected_orders", "futures_roll_trades",
+            "futures_fees_usd", "max_futures_margin_pct_nav",
+            "futures_margin_warning_count", "futures_margin_breach_count",
+            "futures_mark_pnl_usd", "futures_close_pnl_usd",
+            "futures_pnl_delta_usd", "futures_pnl_contribution_pct_nav",
+            "gold_trades", "gold_rejected_orders", "gold_fees_usd",
         ]}

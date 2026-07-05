@@ -26,8 +26,8 @@ class MarketRuleEngine(IMarketRuleEngine):
 
         Checks: market hours, lunch break, (future: halt, limit up/down).
         """
-        # Crypto: always tradable
-        if market == Market.CRYPTO:
+        # Data-driven 24h-style markets are tradable when price data exists.
+        if market in (Market.CRYPTO, Market.GOLD, Market.FUTURES):
             return True, "ok"
 
         # Check market hours (including lunch breaks)

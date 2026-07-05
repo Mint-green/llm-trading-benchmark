@@ -44,12 +44,46 @@ US = 3
 HK = 5
 CN = 3
 CRYPTO = 10
+GOLD = 0
+FUTURES = 0
 
 [costs.slippage_bps]
 US = 5
 HK = 5
 CN = 5
 CRYPTO = 10
+GOLD = 5
+FUTURES = 2
+
+[gold]
+enabled = true
+allowed_symbols = ["XAUUSD.FOREX"]
+ask_symbol = "XAUUSD.FOREX.ASK"
+max_exposure_pct_nav = 0.25
+slippage_bps = 5
+
+[futures]
+enabled = true
+allowed_symbols = ["GC.FUT"]
+allow_short = false
+max_contracts_per_symbol = 1
+max_abs_notional_pct_nav = 0.50
+max_total_abs_notional_pct_nav = 1.00
+max_margin_pct_nav = 0.10
+max_total_margin_pct_nav = 0.20
+max_risk_budget_pct_nav = 0.01
+roll_days_before_expiry = 5
+force_close_days_before_expiry = 2
+commission_per_contract = 2.50
+slippage_bps = 2
+min_dollar_volume_lookback = 0
+liquidity_lookback_bars = 12
+execution_price_mode = "next_bar_open"
+gc_multiplier = 100.0
+gc_tick_size = 0.1
+gc_tick_value = 10.0
+gc_initial_margin = 12000.0
+gc_maintenance_margin = 11000.0
 
 [agent]
 max_rounds = 8

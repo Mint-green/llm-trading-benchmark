@@ -5,7 +5,7 @@ Lot sizes loaded from getStockData project:
   US: 1 share (no lot restriction)
   CN: 100 shares per lot (fixed)
   HK: varies by stock (loaded from HK_shares.py)
-  Crypto: none (fractional ok)
+  Crypto/Gold: none (fractional ok)
 """
 
 from __future__ import annotations
@@ -79,6 +79,14 @@ class ExecutionEngine(IExecutionEngine):
                 quantity=rounded_qty,
                 reason=order.reason,
                 order_type=order.order_type,
+                asset_type=order.asset_type,
+                action=order.action,
+                futures_side=order.futures_side,
+                target_notional_pct_nav=order.target_notional_pct_nav,
+                max_margin_pct_nav=order.max_margin_pct_nav,
+                risk_budget_pct_nav=order.risk_budget_pct_nav,
+                unit_hint=order.unit_hint,
+                risk_trigger=order.risk_trigger,
             ),
             success=True,
             price=price,
@@ -87,7 +95,7 @@ class ExecutionEngine(IExecutionEngine):
         )
 
     @staticmethod
-    def _round_lots(market: Market, symbol: str, quantity: int, side: OrderSide) -> int:
+    def _round_lots(market: Market, symbol: str, quantity: float, side: OrderSide) -> float:
         """Round quantity to valid lot size for the market.
 
         Buy: round DOWN (can't buy partial lots)
@@ -96,7 +104,10 @@ class ExecutionEngine(IExecutionEngine):
         if side == OrderSide.SELL:
             return quantity  # sell any quantity
 
-        if market in (Market.US, Market.CRYPTO):
+        if market in (Market.CRYPTO, Market.GOLD):
+            return round(float(quantity), 8)
+
+        if market == Market.US:
             return max(1, math.floor(quantity))
 
         if market == Market.CN:

@@ -21,6 +21,8 @@ _CONSTITUENT_MAP = {
     Market.HK: ("HK_shares.py", "HK_STOCKS"),
     Market.CN: ("A_shares.py", "A_SHARE_SSE50_CONSTITUENTS"),
     Market.CRYPTO: ("Crypto_shares.py", "CRYPTO_STOCKS"),
+    Market.GOLD: ("Gold_shares.py", "GOLD_STOCKS"),
+    Market.FUTURES: ("Futures_shares.py", "FUTURES_STOCKS"),
 }
 
 # Ticker suffix per market (for building full ticker from raw symbol)
@@ -29,6 +31,8 @@ _SUFFIX_MAP = {
     Market.HK: ".HK",
     Market.CN: "",  # CN symbols already have "sh." or "sz." prefix
     Market.CRYPTO: ".CC",
+    Market.GOLD: "",
+    Market.FUTURES: "",
 }
 
 
@@ -80,6 +84,9 @@ class UniverseRegistry(IUniverseRegistry):
             return self._cache[market]
 
         symbols = self._load_symbols(market)
+        if market == Market.GOLD:
+            allowed = set(getattr(self._config.gold, "allowed_symbols", ("XAUUSD.FOREX",)))
+            symbols = [sym for sym in symbols if sym in allowed]
         assets = []
         for sym in symbols:
             # Determine sector (placeholder — real sector data would come from a registry)
@@ -88,7 +95,7 @@ class UniverseRegistry(IUniverseRegistry):
                 name=sym,  # name resolved later if needed
                 market=market,
                 sector="",
-                asset_class="crypto" if market == Market.CRYPTO else "equity",
+                asset_class="crypto" if market == Market.CRYPTO else "futures" if market == Market.FUTURES else "gold_spot" if market == Market.GOLD else "equity",
             ))
 
         self._cache[market] = assets

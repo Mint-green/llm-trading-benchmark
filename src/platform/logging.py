@@ -15,7 +15,7 @@ import os
 import sqlite3
 from datetime import datetime
 
-from src.core.types import Decision, PortfolioSnapshot, TradeResult, AgentRound, BenchmarkResult
+from src.core.types import Decision, PortfolioSnapshot, TradeResult, AgentRound, BenchmarkResult, FuturesMarkResult
 from src.core.interfaces import IExperimentLogger
 
 
@@ -132,12 +132,13 @@ class ExperimentLogger(IExperimentLogger):
                 symbol TEXT,
                 market TEXT,
                 side TEXT,
-                quantity INTEGER,
+                quantity REAL,
                 price REAL,
                 cost REAL,
                 fees REAL,
                 success INTEGER,
                 error TEXT,
+                metadata TEXT,
                 FOREIGN KEY (run_id) REFERENCES benchmark_runs(run_id)
             );
 
@@ -149,6 +150,10 @@ class ExperimentLogger(IExperimentLogger):
                 nav REAL,
                 positions TEXT,
                 market_exposure TEXT,
+                futures_positions TEXT,
+                futures_margin_locked REAL DEFAULT 0,
+                futures_margin_state TEXT DEFAULT 'OK',
+                futures_pnl_delta REAL DEFAULT 0,
                 FOREIGN KEY (run_id) REFERENCES benchmark_runs(run_id)
             );
 
@@ -161,6 +166,42 @@ class ExperimentLogger(IExperimentLogger):
                 llm_response TEXT,
                 tool_results TEXT,
                 latency_ms REAL,
+                FOREIGN KEY (run_id) REFERENCES benchmark_runs(run_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS futures_marks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT,
+                timestamp TEXT,
+                continuous_symbol TEXT,
+                actual_contract TEXT,
+                previous_mark_price REAL,
+                current_price REAL,
+                pnl_delta REAL,
+                cumulative_variation_pnl REAL,
+                cash_usd_after REAL,
+                margin_locked REAL,
+                margin_state TEXT,
+                FOREIGN KEY (run_id) REFERENCES benchmark_runs(run_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS futures_roll_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT,
+                timestamp TEXT,
+                continuous_symbol TEXT,
+                old_contract TEXT,
+                new_contract TEXT,
+                old_contracts REAL,
+                new_contracts REAL,
+                old_close_price REAL,
+                new_open_price REAL,
+                roll_gap REAL,
+                roll_cost REAL,
+                selection_method TEXT,
+                status TEXT,
+                reject_reason TEXT,
+                event_json TEXT,
                 FOREIGN KEY (run_id) REFERENCES benchmark_runs(run_id)
             );
 
@@ -330,6 +371,16 @@ class ExperimentLogger(IExperimentLogger):
                 created_at TEXT NOT NULL
             );
         """)
+        self._ensure_column("trades", "metadata", "TEXT")
+        self._ensure_column("portfolio_snapshots", "futures_positions", "TEXT")
+        self._ensure_column("portfolio_snapshots", "futures_margin_locked", "REAL DEFAULT 0")
+        self._ensure_column("portfolio_snapshots", "futures_margin_state", "TEXT DEFAULT 'OK'")
+        self._ensure_column("portfolio_snapshots", "futures_pnl_delta", "REAL DEFAULT 0")
+
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        cols = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in cols:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def log_decision(self, timestamp: str, decision: Decision, snapshot: PortfolioSnapshot) -> None:
         trades_json = json.dumps([
@@ -347,13 +398,14 @@ class ExperimentLogger(IExperimentLogger):
 
     def log_trade(self, result: TradeResult, timestamp: str = "") -> None:
         self._conn.execute(
-            "INSERT INTO trades (run_id, timestamp, symbol, market, side, quantity, price, cost, fees, success, error) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO trades (run_id, timestamp, symbol, market, side, quantity, price, cost, fees, success, error, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (self._run_id, timestamp,
              result.order.symbol, result.order.market.value,
              result.order.side.value, result.order.quantity,
              result.price, result.cost, result.fees,
-             1 if result.success else 0, result.error),
+             1 if result.success else 0, result.error,
+             json.dumps(result.metadata, ensure_ascii=False)),
         )
         self._conn.commit()
 
@@ -425,11 +477,49 @@ class ExperimentLogger(IExperimentLogger):
         exposure_json = json.dumps({
             m.value: v for m, v in snapshot.market_exposure.items()
         })
+        futures_json = json.dumps({
+            k: {
+                "actual_contract": p.contract_ticker,
+                "side": p.side,
+                "contracts": p.contracts,
+                "price": p.current_price,
+                "margin_locked": p.margin_locked,
+                "cum_pnl": p.cumulative_variation_pnl,
+            }
+            for k, p in snapshot.futures_positions.items()
+        })
         self._conn.execute(
-            "INSERT INTO portfolio_snapshots (run_id, timestamp, cash, nav, positions, market_exposure) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO portfolio_snapshots (run_id, timestamp, cash, nav, positions, market_exposure, futures_positions, futures_margin_locked, futures_margin_state, futures_pnl_delta) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (self._run_id, snapshot.timestamp, snapshot.cash,
-             snapshot.total_nav, positions_json, exposure_json),
+             snapshot.total_nav, positions_json, exposure_json, futures_json,
+             snapshot.futures_margin_locked, snapshot.futures_margin_state,
+             snapshot.futures_pnl_delta),
+        )
+        self._conn.commit()
+
+    def log_futures_mark(self, mark: FuturesMarkResult, cash_usd_after: float) -> None:
+        self._conn.execute(
+            "INSERT INTO futures_marks (run_id, timestamp, continuous_symbol, actual_contract, previous_mark_price, current_price, pnl_delta, cumulative_variation_pnl, cash_usd_after, margin_locked, margin_state) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (self._run_id, mark.timestamp, mark.continuous_symbol, mark.contract_ticker,
+             mark.previous_mark_price, mark.current_price, mark.pnl_delta,
+             mark.cumulative_variation_pnl, cash_usd_after, mark.margin_locked,
+             mark.margin_state),
+        )
+        self._conn.commit()
+
+    def log_futures_roll_event(self, event: dict) -> None:
+        self._conn.execute(
+            "INSERT INTO futures_roll_events (run_id, timestamp, continuous_symbol, old_contract, new_contract, old_contracts, new_contracts, old_close_price, new_open_price, roll_gap, roll_cost, selection_method, status, reject_reason, event_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (self._run_id, event.get("timestamp", ""), event.get("continuous_symbol", ""),
+             event.get("old_contract", ""), event.get("new_contract", ""),
+             event.get("old_contracts", 0), event.get("new_contracts", 0),
+             event.get("old_close_price", 0.0), event.get("new_open_price", 0.0),
+             event.get("roll_gap", 0.0), event.get("roll_cost", 0.0),
+             event.get("selection_method", ""), event.get("status", ""),
+             event.get("reject_reason", ""), json.dumps(event, ensure_ascii=False)),
         )
         self._conn.commit()
 

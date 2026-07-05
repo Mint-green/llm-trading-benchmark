@@ -44,6 +44,8 @@ MARKET_CURRENCY = {
     Market.HK: "HKD",
     Market.CN: "CNY",
     Market.CRYPTO: "USD",
+    Market.GOLD: "USD",
+    Market.FUTURES: "USD",
 }
 
 
@@ -75,6 +77,11 @@ class PortfolioEngine(IPortfolioEngine):
         }
 
         self._positions: dict[str, Position] = {}  # key: "MARKET:SYMBOL"
+        self._futures_positions: dict = {}
+        self._futures_margin_locked: float = 0.0
+        self._futures_margin_state: str = "OK"
+        self._futures_pnl_delta: float = 0.0
+        self._reserved_usd: float = 0.0
         self._trade_history: list[TradeResult] = []
         self._fx_log: list[FxLog] = []
 
@@ -116,6 +123,10 @@ class PortfolioEngine(IPortfolioEngine):
             market_exposure=dict(market_exposure),
             fx_rates=dict(self._config.fx_rates),
             frozen_keys=frozen_keys,
+            futures_positions=dict(self._futures_positions),
+            futures_margin_locked=self._futures_margin_locked,
+            futures_margin_state=self._futures_margin_state,
+            futures_pnl_delta=self._futures_pnl_delta,
         )
 
     def ensure_cash(self, currency: str, amount_needed: float, timestamp: str) -> bool:
@@ -125,15 +136,19 @@ class PortfolioEngine(IPortfolioEngine):
         Returns True if successful, False if insufficient total funds.
         """
         current = self._cash.get(currency, 0.0)
+        if currency == "USD":
+            current = max(0.0, current - self._reserved_usd)
         if current >= amount_needed:
             return True
+        if currency == "USD":
+            return False
 
         deficit = amount_needed - current
         # Try to convert from USD (include FX fee)
         usd_needed = self._nav.convert_to_usd(deficit, currency)
         fx_fee = usd_needed * (self._config.fx_fee_bps / 10_000)
         usd_total = usd_needed + fx_fee
-        usd_available = self._cash["USD"]
+        usd_available = max(0.0, self._cash["USD"] - self._reserved_usd)
 
         if usd_available < usd_total:
             return False  # insufficient funds overall
@@ -155,7 +170,7 @@ class PortfolioEngine(IPortfolioEngine):
         return True
 
     def execute_buy(
-        self, symbol: str, market: Market, quantity: int, price: float, fees: float,
+        self, symbol: str, market: Market, quantity: float, price: float, fees: float,
     ) -> None:
         """Execute a buy. Price in local currency, stored as USD in position."""
         currency = MARKET_CURRENCY.get(market, "USD")
@@ -186,7 +201,7 @@ class PortfolioEngine(IPortfolioEngine):
             )
 
     def execute_sell(
-        self, symbol: str, market: Market, quantity: int, price: float, fees: float,
+        self, symbol: str, market: Market, quantity: float, price: float, fees: float,
     ) -> None:
         """Execute a sell. Price in local currency."""
         currency = MARKET_CURRENCY.get(market, "USD")
@@ -311,6 +326,20 @@ class PortfolioEngine(IPortfolioEngine):
     def fx_log(self) -> list[FxLog]:
         return list(self._fx_log)
 
+
+    def sync_futures_state(self, cash_usd: float, positions: dict, margin_locked: float, margin_state: str, pnl_delta: float = 0.0) -> None:
+        """Sync futures account cash and reserved margin into portfolio state."""
+        self._cash["USD"] = cash_usd
+        self._futures_positions = dict(positions)
+        self._futures_margin_locked = margin_locked
+        self._futures_margin_state = margin_state
+        self._futures_pnl_delta = pnl_delta
+        self._reserved_usd = margin_locked
+
+    @property
+    def reserved_usd(self) -> float:
+        return self._reserved_usd
+
     def update_prices(self, prices: dict[str, float]) -> None:
         """Update current prices for all positions. prices in USD."""
         for key, price in prices.items():
@@ -380,7 +409,10 @@ class PortfolioEngine(IPortfolioEngine):
 
             if delta_value_usd > 0:
                 # BUY
-                quantity = int(delta_value_usd / price_usd) if price_usd > 0 else 0
+                if market in (Market.CRYPTO, Market.GOLD):
+                    quantity = round(delta_value_usd / price_usd, 8) if price_usd > 0 else 0
+                else:
+                    quantity = int(delta_value_usd / price_usd) if price_usd > 0 else 0
                 if quantity > 0:
                     orders.append(TradeOrder(
                         symbol=sym,
@@ -395,7 +427,10 @@ class PortfolioEngine(IPortfolioEngine):
                 if pos is None:
                     skipped.append({"symbol": sym, "reason": "no position to sell"})
                     continue
-                quantity = min(pos.quantity, int(abs(delta_value_usd) / price_usd)) if price_usd > 0 else 0
+                if market in (Market.CRYPTO, Market.GOLD):
+                    quantity = min(pos.quantity, round(abs(delta_value_usd) / price_usd, 8)) if price_usd > 0 else 0
+                else:
+                    quantity = min(pos.quantity, int(abs(delta_value_usd) / price_usd)) if price_usd > 0 else 0
                 if quantity > 0:
                     orders.append(TradeOrder(
                         symbol=sym,

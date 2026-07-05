@@ -18,7 +18,7 @@ class SettlementEngine(ISettlementEngine):
     def __init__(self):
         # Tracks buy timestamps per position key for T+1 enforcement
         # key: "MARKET:SYMBOL", value: list of (timestamp, quantity)
-        self._buy_history: dict[str, list[tuple[str, int]]] = defaultdict(list)
+        self._buy_history: dict[str, list[tuple[str, float]]] = defaultdict(list)
 
     def settle(self, result: TradeResult, timestamp: str) -> None:
         """Record settlement. For buys, track the acquisition timestamp."""
@@ -42,7 +42,7 @@ class SettlementEngine(ISettlementEngine):
                     self._buy_history[key][0] = (ts, qty - remaining)
                     remaining = 0
 
-    def get_sellable_quantity(self, key: str, timestamp: str) -> int:
+    def get_sellable_quantity(self, key: str, timestamp: str) -> float:
         """How many shares can be sold at this timestamp (T+1 aware).
 
         For CN market: shares bought today cannot be sold until tomorrow.
