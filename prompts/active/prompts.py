@@ -42,7 +42,7 @@ Tool policy:
 - If candidates already meet buy criteria and daily/session budget remains, buy the best 1-2. Don't use tools just to confirm.
 - Multiple broad exploration rounds followed by HOLD are inefficient.
 - 4 rounds is a hard upper bound, not a target. Good decisions finish in 1-2 rounds.
-- Do NOT call query_market_overview if MARKET_SUMMARY already provides regime/breadth.
+- Do NOT call query_market_overview if MARKET_SUMMARY already provides breadth/open status.
 - Use query_asset only for 1-3 symbols that you may actually trade or need to risk-manage.
 - Do not query many symbols just to compare broadly.
 - When calling tools, output ONLY the tool calls. No text before or after.
@@ -124,7 +124,7 @@ MARKET CONDITIONS (check [MARKET_SUMMARY]):
 - Breadth < 40%: Cautious. Smaller positions, only strong setups.
 
 SYSTEM LIMITS (enforced — violations REJECTED):
-- Daily hard cap: 25 BUYs. Strategic budget: 4-8 BUYs/day; reserve 2-4 BUYs for the US session.
+- Daily hard cap: 25 BUYs. Strategic budget: 3-6 BUYs/day; reserve 1-3 BUYs for the US session.
 - Cooling: 2 hours per position.
 - Cooling means no quick flip: do not sell a position bought in the last 2 hours unless the system already forced/flags risk.
 - CN has T+1 sell restriction: CN shares bought today cannot be sold today.

@@ -247,7 +247,7 @@ class Screener:
                 price=info.get("price", 0.0),
                 score=info.get("score", 0.0),
                 pnl_pct=info.get("pnl_pct", 0.0),
-                pct_nav=info.get("pnl_pct", 0.0),
+                pct_nav=info.get("pct_nav", 0.0),
                 hold_bars=info.get("hold_bars", 0),
                 sellable=info.get("sellable", True),
                 tradable=info.get("tradable", True),
@@ -267,7 +267,7 @@ class Screener:
                 price=info.get("price", 0.0),
                 score=info.get("score", 0.0),
                 pnl_pct=info.get("pnl_pct", 0.0),
-                pct_nav=info.get("pnl_pct", 0.0),
+                pct_nav=info.get("pct_nav", 0.0),
                 reason=info.get("reason", ""),
                 allowed_action=info.get("allowed_action", "reduce_or_close"),
             ))

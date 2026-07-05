@@ -8,7 +8,7 @@ Decision types:
   focused_market_or_risk_decision — market/risk event
 
 Schedule (per market):
-  normal:            every 30min
+  normal:            configured interval
   open_window:       first 30min after open, every 15min
   close_window:      last 30min before close, every 15min
   tail_guard:        last 15min before close, block new buys/increases
@@ -103,7 +103,7 @@ class DecisionScheduler:
 
         # Check normal interval boundary
         if self._is_normal_decision_time(time_part):
-            if not self._last_full_decision or self._minutes_since(timestamp, self._last_full_decision) >= 60:
+            if not self._last_full_decision or self._minutes_since(timestamp, self._last_full_decision) >= self._schedule.normal_interval_minutes:
                 return True
 
         return False
@@ -176,10 +176,10 @@ class DecisionScheduler:
                     tail_guard_markets=tail_guard_markets,
                 )
 
-        # Priority 3: Normal full decision (every 30min)
+        # Priority 3: Normal full decision (configured interval)
         if self._is_normal_decision_time(time_part):
             # Check if we already did a full decision recently
-            if not self._last_full_decision or self._minutes_since(timestamp, self._last_full_decision) >= 60:
+            if not self._last_full_decision or self._minutes_since(timestamp, self._last_full_decision) >= self._schedule.normal_interval_minutes:
                 self._last_full_decision = timestamp
                 return DecisionRequest(
                     timestamp=timestamp,
@@ -291,7 +291,7 @@ class DecisionScheduler:
         return len(active_markets) > 0, active_markets
 
     def _is_normal_decision_time(self, time_part: str) -> bool:
-        """Check if this is a normal decision time (every 30min)."""
+        """Check if this is a normal decision boundary."""
         try:
             dt = datetime.strptime(time_part, "%H:%M")
             return dt.minute % self._schedule.normal_interval_minutes == 0

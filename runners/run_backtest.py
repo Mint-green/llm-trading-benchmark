@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--model", default=None, help="Model name (e.g., mimo-v2.5-pro, deepseek-v4-pro)")
     parser.add_argument("--start", default=None, help="Backtest start date (YYYY-MM-DD)")
     parser.add_argument("--end", default=None, help="Backtest end date (YYYY-MM-DD)")
-    parser.add_argument("--interval", type=int, default=None, help="Decision interval in minutes")
+    parser.add_argument("--interval", type=int, default=None, help="Timestamp/scanner interval in minutes")
     parser.add_argument("--initial-cash", type=float, default=None, help="Initial cash amount")
     parser.add_argument("--max-decisions", type=int, default=None, help="Max decisions (0=unlimited)")
     parser.add_argument("--max-rounds", type=int, default=None, help="Max LLM rounds per decision")

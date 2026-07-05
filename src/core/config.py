@@ -53,7 +53,7 @@ class CloseWindowConfig:
 @dataclass(frozen=True)
 class DecisionScheduleConfig:
     """Full decision scheduling configuration."""
-    normal_interval_minutes: int = 60
+    normal_interval_minutes: int = 30
     open_window: OpenWindowConfig = field(default_factory=OpenWindowConfig)
     close_window: CloseWindowConfig = field(default_factory=CloseWindowConfig)
 
@@ -245,6 +245,9 @@ class Config:
         limits_cfg = portfolio_cfg.get("position_limits", {})
         costs_cfg = data.get("costs", {})
         agent_cfg = data.get("agent", {})
+        schedule_cfg = data.get("decision_schedule", {})
+        open_window_cfg = schedule_cfg.get("open_window", {})
+        close_window_cfg = schedule_cfg.get("close_window", {})
 
         # Determine which API to use based on model name
         model_name = model_cfg.get("name", "mimo-v2.5-pro")
@@ -289,6 +292,22 @@ class Config:
             },
             # Agent
             "max_agent_rounds": agent_cfg.get("max_rounds", 4),
+            # Decision schedule
+            "decision_schedule": DecisionScheduleConfig(
+                normal_interval_minutes=schedule_cfg.get("normal_interval_minutes", 30),
+                open_window=OpenWindowConfig(
+                    enabled=open_window_cfg.get("enabled", True),
+                    minutes_after_open=open_window_cfg.get("minutes_after_open", 30),
+                    interval_minutes=open_window_cfg.get("interval_minutes", 15),
+                    include_open_plus_30=open_window_cfg.get("include_open_plus_30", True),
+                ),
+                close_window=CloseWindowConfig(
+                    enabled=close_window_cfg.get("enabled", True),
+                    minutes_before_close=close_window_cfg.get("minutes_before_close", 30),
+                    interval_minutes=close_window_cfg.get("interval_minutes", 15),
+                    include_close_time=close_window_cfg.get("include_close_time", False),
+                ),
+            ),
         }
 
         # Load all API keys (both models)
@@ -316,6 +335,11 @@ class Config:
             "max_agent_rounds": self.max_agent_rounds,
             "temperature": self.temperature,
             "thinking_enabled": self.thinking_enabled,
+            "decision_schedule": {
+                "normal_interval_minutes": self.decision_schedule.normal_interval_minutes,
+                "open_window_interval_minutes": self.decision_schedule.open_window.interval_minutes,
+                "close_window_interval_minutes": self.decision_schedule.close_window.interval_minutes,
+            },
             "position_limits": {
                 "max_single": self.position_limits.max_single_position,
                 "max_market": self.position_limits.max_market_exposure,

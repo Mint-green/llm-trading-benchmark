@@ -61,9 +61,14 @@ class ConstraintEngine(IConstraintEngine):
 
     @property
     def daily_buys_remaining(self) -> int:
-        """How many BUYs are left today (for LLM context)."""
+        """How many BUYs are left for the latest tracked day."""
         today = max(self._daily_trades.keys(), default="")
-        used = self._daily_trades.get(today, 0)
+        return self.daily_buys_remaining_at(today)
+
+    def daily_buys_remaining_at(self, timestamp: str) -> int:
+        """How many BUYs are left for the timestamp's calendar day."""
+        date = timestamp[:10]
+        used = self._daily_trades.get(date, 0)
         return max(0, self._max_daily_trades - used)
 
     def check_daily_limit(self, timestamp: str) -> tuple[bool, str]:

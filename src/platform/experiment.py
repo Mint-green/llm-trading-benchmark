@@ -118,6 +118,8 @@ class ExperimentRunner:
 
         # Risk mode
         self._risk_mode = RiskMode.GREEN
+        self._stop_loss_buy_pause_until: dict[Market, str] = {}
+        self._pending_daily_summary_injection = False
 
     def run(self) -> BenchmarkResult:
         """Run the complete benchmark."""
@@ -211,7 +213,7 @@ class ExperimentRunner:
             # Daily summary at 00:05 UTC (before any market logic)
             from datetime import datetime as _dt
             time_part = ts[11:16] if len(ts) >= 16 else ""
-            if time_part == "00:05" and daily_decisions:
+            if self._should_generate_daily_rollover_summary(ts, daily_decisions):
                 from src.evaluation.summary_engine import SummaryEngine
                 from datetime import timedelta as _td
                 summary_date = ts[:10]
@@ -229,32 +231,36 @@ class ExperimentRunner:
                     plans=[],
                 )
                 self.memory.save_daily_summary(daily_summary)
+                self._pending_daily_summary_injection = True
                 print(f"  Daily summary: {prev_date} | return={daily_summary.daily_return_pct:+.2%} | NAV=${nav_end:,.0f}")
                 daily_start_nav = nav_end
                 daily_decisions = []
                 daily_session_summaries = []
                 last_daily_summary_date = summary_date
 
-            # Skip weekends (stock markets closed)
+            # Do not skip weekends here: stock markets are closed, but crypto remains open.
             try:
-                _d = _dt.strptime(ts[:16], "%Y-%m-%d %H:%M")
-                if _d.weekday() >= 5:
-                    continue
+                _dt.strptime(ts[:16], "%Y-%m-%d %H:%M")
             except ValueError:
                 continue
 
-            # Session summary at market close + 5min (after weekend skip)
+            # Session summary at market close + 5min
             just_closed = self._just_closed_market(ts)
             if just_closed:
                 summary = self._generate_session_summary(just_closed, ts, snapshot)
                 if summary:
                     daily_session_summaries.append(summary)
 
+            # --- 5min local scanner ---
+            plans = self.memory.get_all_plans()
+            snapshot, auto_sell_feedback = self._run_5min_scanner(
+                ts, snapshot, open_markets, all_bars, plans, fx_rates,
+            )
+
             # --- Decision scheduling ---
             _t0 = _time.time()
-            plans = self.memory.get_all_plans()
 
-            # Quick scheduler pre-check (no state update, no event detection)
+            # Quick scheduler pre-check (no event detection)
             has_stock_market = any(m in open_markets for m in [Market.US, Market.HK, Market.CN])
             has_crypto_position = any(
                 pos.market == Market.CRYPTO for pos in snapshot.positions.values()
@@ -264,11 +270,9 @@ class ExperimentRunner:
 
             # Crypto-only period: schedule light_decision at lower frequency
             if not has_stock_market:
-                # Check if it's time for a light_decision
+                # Check if it's time for a light_decision.
                 light_interval = 60 if has_crypto_position else 240  # 1h or 4h
-                time_part = ts[11:16] if len(ts) >= 16 else ""
-                # Only trigger at :00 of each hour (or every 4th hour)
-                if time_part == "00:00" or (light_interval == 240 and int(time_part[:2]) % 4 == 0):
+                if self._is_light_decision_boundary(ts, light_interval):
                     if not self._last_light_decision or \
                        self.scheduler._minutes_since(ts, self._last_light_decision) >= light_interval:
                         self._last_light_decision = ts
@@ -316,10 +320,6 @@ class ExperimentRunner:
                 )
                 if decision_request.decision_type == DecisionType.AUTO_HOLD:
                     # Still AUTO_HOLD after trigger check — skip
-                    self._update_plan_peaks(plans, snapshot)
-                    self.memory.expire_thesis(ts)
-                    self.memory.expire_watchlist(ts)
-                    self.memory.expire_avoid(ts)
                     self.logger.log_snapshot(snapshot)
                     portfolio_history.append(snapshot)
                     if i % 12 == 0:
@@ -340,11 +340,7 @@ class ExperimentRunner:
                 )
 
             # --- Common processing for non-AUTO_HOLD ---
-            self._update_plan_peaks(plans, snapshot)
-            self.memory.expire_thesis(ts)
-            self.memory.expire_watchlist(ts)
-            self.memory.expire_avoid(ts)
-
+            # 5min scanner already updated plan peaks and memory expirations.
             self.portfolio._constraints.set_tail_guard(
                 decision_request.tail_guard_active,
                 decision_request.tail_guard_markets,
@@ -399,7 +395,9 @@ class ExperimentRunner:
                     open_markets=[Market.CRYPTO],
                 )
 
-                memory_state = self.memory.get_memory_state()
+                memory_state = self.memory.get_memory_state(
+                    is_first_decision=self._consume_daily_summary_injection(),
+                )
 
                 # Build light decision context
                 messages = self.context_builder.build_full_decision(
@@ -414,6 +412,7 @@ class ExperimentRunner:
                     benchmark_day=0,
                     bar_index=i,
                     round_num=1,
+                    decision_type="light_decision",
                 )
 
             elif decision_request.decision_type == DecisionType.FULL_DECISION:
@@ -448,7 +447,9 @@ class ExperimentRunner:
                     open_markets=open_markets,
                 )
 
-                memory_state = self.memory.get_memory_state()
+                memory_state = self.memory.get_memory_state(
+                    is_first_decision=self._consume_daily_summary_injection(),
+                )
 
                 messages = self.context_builder.build_full_decision(
                     timestamp=ts,
@@ -512,42 +513,6 @@ class ExperimentRunner:
 
             _t_ctx = _time.time() - _t_ctx_start
 
-            # --- Auto stop-loss: sell positions exceeding threshold ---
-            auto_sell_feedback = []
-            stop_loss_pct = -0.03  # -3% stop-loss
-            for key, pos in list(snapshot.positions.items()):
-                if pos.quantity <= 0 or pos.avg_cost <= 0:
-                    continue
-                pnl_pct = (pos.current_price - pos.avg_cost) / pos.avg_cost
-                if pnl_pct <= stop_loss_pct:
-                    # Check if position is sellable (not frozen, market open)
-                    is_tradable = pos.market in open_markets
-                    is_frozen = key in snapshot.frozen_keys
-                    if is_tradable and not is_frozen:
-                        from src.core.types import TradeOrder, OrderSide
-                        sell_order = TradeOrder(
-                            symbol=pos.symbol,
-                            market=pos.market,
-                            side=OrderSide.SELL,
-                            quantity=pos.quantity,
-                            reason=f"auto_stop_loss: PnL={pnl_pct*100:.1f}% <= {stop_loss_pct*100:.0f}%",
-                        )
-                        price = self._get_price(pos.symbol, pos.market, ts, all_bars)
-                        if price:
-                            result = self.portfolio.process_order(sell_order, price, ts)
-                            self.logger.log_trade(result, ts)
-                            if result.success:
-                                auto_sell_feedback.append(f"AUTO SELL {pos.symbol}({pos.market.value}): PnL={pnl_pct*100:.1f}% hit stop-loss")
-                                print(f"  [{ts}] AUTO STOP-LOSS: SELL {pos.symbol}({pos.market.value}) PnL={pnl_pct*100:.1f}%", flush=True)
-            if auto_sell_feedback:
-                # Refresh snapshot after auto-sells
-                snapshot = self.portfolio.get_snapshot(ts)
-                self.memory.record_risk_change(
-                    "loss_cooldown: " + "; ".join(auto_sell_feedback[-3:]) +
-                    " | pause new BUYs except exceptional +2 setups; no immediate replacement trade",
-                    ts,
-                )
-
             # Run agent
             trade_feedback = "\n".join(auto_sell_feedback) if auto_sell_feedback else ""
             decision = Decision(action="hold", reason="no decision")
@@ -559,10 +524,15 @@ class ExperimentRunner:
                 decision, rounds = self.agent.run(
                     ts, snapshot, "", "", "", "",
                     trade_feedback=trade_feedback,
-                    buy_quota_remaining=self.portfolio._constraints.daily_buys_remaining,
+                    buy_quota_remaining=self.portfolio._constraints.daily_buys_remaining_at(ts),
                     pre_built_messages=messages,
                 )
                 _t_llm += _time.time() - _t_llm_start
+                if decision_request.decision_type == DecisionType.LIGHT_DECISION:
+                    decision = self._restrict_light_decision_trades(
+                        decision, allow_new_crypto_buys=has_crypto_position,
+                    )
+                decision = self._filter_stop_loss_cooldown_buys(decision, ts)
                 all_rounds.extend(rounds)
 
                 # Log LLM call details, agent rounds, and tool calls
@@ -926,6 +896,212 @@ class ExperimentRunner:
             n = len(all_bars.get(market, {}))
             lines.append(f"{market.value}: {n} stocks")
         return "\n".join(lines)
+
+
+
+    def _should_generate_daily_rollover_summary(self, timestamp: str, daily_decisions: list[dict]) -> bool:
+        """Generate rollover summaries only after a completed in-run day."""
+        time_part = timestamp[11:16] if len(timestamp) >= 16 else ""
+        if time_part != "00:05" or not daily_decisions:
+            return False
+        return timestamp[:10] != self.config.backtest_start
+
+    def _consume_daily_summary_injection(self) -> bool:
+        """Return True once after a daily summary is saved for prompt injection."""
+        pending = getattr(self, "_pending_daily_summary_injection", False)
+        self._pending_daily_summary_injection = False
+        return pending
+
+    @staticmethod
+    def _is_light_decision_boundary(timestamp: str, light_interval_minutes: int) -> bool:
+        """Return True on hourly or multi-hour light decision boundaries."""
+        time_part = timestamp[11:16] if len(timestamp) >= 16 else ""
+        try:
+            hour = int(time_part[:2])
+            minute = int(time_part[3:5])
+        except (ValueError, IndexError):
+            return False
+
+        if minute != 0:
+            return False
+        if light_interval_minutes <= 60:
+            return True
+
+        interval_hours = max(1, light_interval_minutes // 60)
+        return hour % interval_hours == 0
+
+    def _run_5min_scanner(
+        self, ts: str, snapshot: PortfolioSnapshot, open_markets: list[Market],
+        all_bars: dict, plans: dict, fx_rates: dict[str, float],
+    ) -> tuple[PortfolioSnapshot, list[str]]:
+        """Run deterministic per-bar maintenance before any LLM scheduling skip."""
+        self._update_plan_peaks(plans, snapshot)
+        self.memory.expire_thesis(ts)
+        self.memory.expire_watchlist(ts)
+        self.memory.expire_avoid(ts)
+
+        auto_sell_feedback = []
+        stop_loss_pct = -0.03
+        for key, pos in list(snapshot.positions.items()):
+            if pos.quantity <= 0 or pos.avg_cost <= 0:
+                continue
+            pnl_pct = (pos.current_price - pos.avg_cost) / pos.avg_cost
+            if pnl_pct > stop_loss_pct:
+                continue
+            if pos.market not in open_markets or key in snapshot.frozen_keys:
+                continue
+
+            sell_order = TradeOrder(
+                symbol=pos.symbol,
+                market=pos.market,
+                side=OrderSide.SELL,
+                quantity=pos.quantity,
+                reason=f"auto_stop_loss: PnL={pnl_pct*100:.1f}% <= {stop_loss_pct*100:.0f}%",
+            )
+            price = self._get_price(pos.symbol, pos.market, ts, all_bars)
+            if not price:
+                continue
+
+            if self._is_auto_sell_cooling_blocked(key, pos.quantity, snapshot, ts):
+                continue
+
+            result = self.portfolio.process_order(sell_order, price, ts)
+            self.logger.log_trade(result, ts)
+            if result.success:
+                auto_sell_feedback.append(
+                    f"AUTO SELL {pos.symbol}({pos.market.value}): PnL={pnl_pct*100:.1f}% hit stop-loss"
+                )
+                self._record_stop_loss_buy_pause(pos.market, ts)
+                print(
+                    f"  [{ts}] AUTO STOP-LOSS: SELL {pos.symbol}({pos.market.value}) PnL={pnl_pct*100:.1f}%",
+                    flush=True,
+                )
+
+        if auto_sell_feedback:
+            snapshot = self.portfolio.get_snapshot(ts)
+            snapshot.fx_rates = fx_rates
+            self.memory.record_risk_change(
+                "loss_cooldown: " + "; ".join(auto_sell_feedback[-3:]) +
+                " | pause new BUYs except exceptional +2 setups; no immediate replacement trade",
+                ts,
+            )
+
+        return snapshot, auto_sell_feedback
+
+    def _is_auto_sell_cooling_blocked(
+        self, key: str, quantity: int, snapshot: PortfolioSnapshot, timestamp: str,
+    ) -> bool:
+        """Return True when auto stop-loss SELL would only create a cooling rejection."""
+        ok, reason = self.portfolio._constraints.validate_sell(
+            key, quantity, snapshot.positions, timestamp=timestamp,
+        )
+        return (not ok) and reason.startswith("cooling period")
+
+    def _record_stop_loss_buy_pause(self, market: Market, timestamp: str) -> None:
+        """Pause same-market new BUYs briefly after deterministic stop-loss."""
+        from datetime import datetime, timedelta
+
+        until = (
+            datetime.strptime(timestamp, "%Y-%m-%d %H:%M") + timedelta(minutes=60)
+        ).strftime("%Y-%m-%d %H:%M")
+        current_until = self._stop_loss_buy_pause_until.get(market)
+        if current_until is None or current_until < until:
+            self._stop_loss_buy_pause_until[market] = until
+
+    def _filter_stop_loss_cooldown_buys(self, decision: Decision, timestamp: str) -> Decision:
+        """Filter same-market BUYs during the brief post-stop-loss pause."""
+        pauses = getattr(self, "_stop_loss_buy_pause_until", {})
+        if not pauses:
+            return decision
+
+        expired = [market for market, until in pauses.items() if until <= timestamp]
+        for market in expired:
+            pauses.pop(market, None)
+
+        if decision.action != "trade" or not decision.trades or not pauses:
+            return decision
+
+        allowed = []
+        blocked = []
+        for trade in decision.trades:
+            pause_until = pauses.get(trade.market)
+            if trade.side == OrderSide.BUY and pause_until and timestamp < pause_until:
+                blocked.append(f"{trade.symbol}({trade.market.value}, until {pause_until})")
+                continue
+            allowed.append(trade)
+
+        if not blocked:
+            return decision
+
+        reason = (
+            f"{decision.reason} | filtered {len(blocked)} post-stop-loss BUY(s): "
+            f"{', '.join(blocked)}"
+        ).strip()
+        if not allowed:
+            return Decision(
+                action="hold",
+                reason=reason,
+                memory_updates=decision.memory_updates,
+                plan_updates=decision.plan_updates,
+            )
+
+        return Decision(
+            action="trade",
+            trades=allowed,
+            reason=reason,
+            memory_updates=decision.memory_updates,
+            plan_updates=decision.plan_updates,
+        )
+
+    @staticmethod
+    def _restrict_light_decision_trades(
+        decision: Decision, allow_new_crypto_buys: bool,
+    ) -> Decision:
+        """Hard-limit light decisions to 24h risk management.
+
+        Without an existing crypto position, light decisions should not open new
+        24h exposure; they are low-frequency checks, not a separate alpha engine.
+        """
+        if decision.action != "trade" or not decision.trades:
+            return decision
+
+        allowed_trades = []
+        removed_scope = 0
+        removed_new_buy = 0
+        for trade in decision.trades:
+            if trade.market != Market.CRYPTO:
+                removed_scope += 1
+                continue
+            if trade.side == OrderSide.BUY and not allow_new_crypto_buys:
+                removed_new_buy += 1
+                continue
+            allowed_trades.append(trade)
+
+        if removed_scope == 0 and removed_new_buy == 0:
+            return decision
+
+        filters = []
+        if removed_scope:
+            filters.append(f"filtered {removed_scope} out-of-scope trade(s) for light_decision")
+        if removed_new_buy:
+            filters.append(f"filtered {removed_new_buy} new crypto BUY(s) without existing 24h position")
+        reason = f"{decision.reason} | {'; '.join(filters)}"
+
+        if not allowed_trades:
+            return Decision(
+                action="hold",
+                reason=reason,
+                memory_updates=decision.memory_updates,
+                plan_updates=decision.plan_updates,
+            )
+
+        return Decision(
+            action="trade",
+            trades=allowed_trades,
+            reason=reason,
+            memory_updates=decision.memory_updates,
+            plan_updates=decision.plan_updates,
+        )
 
     def _update_plan_peaks(self, plans: dict, snapshot) -> None:
         """Update plan peak prices for trailing stop tracking."""

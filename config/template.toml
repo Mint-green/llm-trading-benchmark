@@ -53,3 +53,20 @@ CRYPTO = 10
 
 [agent]
 max_rounds = 8
+
+
+# Full LLM decision cadence. --interval controls the local timestamp/scanner grid.
+[decision_schedule]
+normal_interval_minutes = 30
+
+[decision_schedule.open_window]
+enabled = true
+minutes_after_open = 30
+interval_minutes = 15
+include_open_plus_30 = true
+
+[decision_schedule.close_window]
+enabled = true
+minutes_before_close = 30
+interval_minutes = 15
+include_close_time = false

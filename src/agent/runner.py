@@ -124,7 +124,7 @@ class AgentRunner(IAgentRunner):
             # Handle function calling response
             if tool_calls:
                 # Execute tool calls
-                tool_results, tool_records = self._execute_tool_calls(tool_calls, timestamp)
+                tool_results, tool_records = self._execute_tool_calls(tool_calls, timestamp, messages)
 
                 # Add controller reminder based on round number
                 if round_num == 1:
@@ -175,13 +175,7 @@ class AgentRunner(IAgentRunner):
             round_data._reasoning = reasoning
 
             if decision.action == "trade":
-                # Resolve pct_nav to quantities and validate
-                resolved_trades = self._resolve_trades(decision.trades, snapshot)
-                final_decision = Decision(
-                    action="trade",
-                    trades=resolved_trades,
-                    reason=decision.reason,
-                )
+                final_decision = self._finalize_trade_decision(decision, snapshot, timestamp)
                 break
 
             elif decision.action == "query" and round_num < self._config.max_agent_rounds:
@@ -199,6 +193,36 @@ class AgentRunner(IAgentRunner):
                 break
 
         return final_decision, rounds
+
+    def _finalize_trade_decision(
+        self, decision: Decision, snapshot: PortfolioSnapshot, timestamp: str,
+    ) -> Decision:
+        """Resolve and filter trades while preserving model memory/plan updates."""
+        resolved_trades = self._resolve_trades(decision.trades, snapshot)
+        resolved_trades, filter_reason = self._filter_cooling_blocked_sells(
+            resolved_trades, snapshot, timestamp,
+        )
+        resolved_trades, lot_filter_reason = self._filter_zero_lot_buys(resolved_trades)
+        reason = decision.reason
+        for extra_reason in (filter_reason, lot_filter_reason):
+            if extra_reason:
+                reason = f"{reason} | {extra_reason}".strip()
+
+        if not resolved_trades:
+            return Decision(
+                action="hold",
+                reason=reason,
+                memory_updates=decision.memory_updates,
+                plan_updates=decision.plan_updates,
+            )
+
+        return Decision(
+            action="trade",
+            trades=resolved_trades,
+            reason=reason,
+            memory_updates=decision.memory_updates,
+            plan_updates=decision.plan_updates,
+        )
 
     @staticmethod
     def _apply_trade_feedback_guards(decision: Decision, trade_feedback: str) -> Decision:
@@ -241,6 +265,78 @@ class AgentRunner(IAgentRunner):
             plan_updates=decision.plan_updates,
         )
 
+    def _filter_cooling_blocked_sells(
+        self, trades: list[TradeOrder], snapshot: PortfolioSnapshot, timestamp: str,
+    ) -> tuple[list[TradeOrder], str]:
+        """Drop LLM SELLs that would be rejected by the cooling-period constraint."""
+        if not trades or self._portfolio is None:
+            return trades, ""
+
+        constraints = getattr(self._portfolio, "_constraints", None)
+        if constraints is None:
+            return trades, ""
+
+        filtered: list[TradeOrder] = []
+        blocked = []
+        for trade in trades:
+            if trade.side != OrderSide.SELL:
+                filtered.append(trade)
+                continue
+
+            key = f"{trade.market.value}:{trade.symbol}"
+            ok, reason = constraints.validate_sell(
+                key, trade.quantity, snapshot.positions, timestamp=timestamp,
+            )
+            if not ok and reason.startswith("cooling period"):
+                blocked.append(f"{trade.symbol}({trade.market.value})")
+                continue
+            filtered.append(trade)
+
+        if not blocked:
+            return trades, ""
+        return filtered, f"filtered {len(blocked)} cooling-blocked SELL(s): {', '.join(blocked)}"
+
+    def _filter_zero_lot_buys(self, trades: list[TradeOrder]) -> tuple[list[TradeOrder], str]:
+        """Drop BUY orders that execution lot rounding would reduce to zero."""
+        if not trades or self._portfolio is None:
+            return trades, ""
+
+        execution = getattr(self._portfolio, "_execution", None)
+        round_lots = getattr(execution, "_round_lots", None)
+        if round_lots is None:
+            return trades, ""
+
+        filtered: list[TradeOrder] = []
+        blocked = []
+        for trade in trades:
+            if trade.side != OrderSide.BUY:
+                filtered.append(trade)
+                continue
+
+            rounded_qty = round_lots(trade.market, trade.symbol, trade.quantity, trade.side)
+            if rounded_qty <= 0:
+                blocked.append(f"{trade.symbol}({trade.market.value}, requested {trade.quantity})")
+                continue
+            filtered.append(trade)
+
+        if not blocked:
+            return trades, ""
+        return filtered, f"filtered {len(blocked)} zero-lot BUY(s): {', '.join(blocked)}"
+
+    @staticmethod
+    def _decision_type_from_messages(messages: list[dict]) -> str:
+        """Extract decision_type from the prompt context, if present."""
+        for msg in messages:
+            content = msg.get("content", "") if isinstance(msg, dict) else ""
+            if not isinstance(content, str) or "decision_type:" not in content:
+                continue
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith("decision_type:"):
+                    value = line.split(":", 1)[1].strip()
+                    return value.strip('"').strip("'")
+        return ""
+
     def _call_llm(self, messages: list[dict]) -> tuple[str, int, int, str]:
         """Call LLM and return (response_text, prompt_tokens, completion_tokens, reasoning_content)."""
         extra = {}
@@ -279,8 +375,15 @@ class AgentRunner(IAgentRunner):
         if not self._config.thinking_enabled:
             extra["extra_body"] = {"thinking": {"type": "disabled"}}
 
-        # Get tool schemas
+        # Get tool schemas. Full/light prompts already include market breadth/open status,
+        # so do not expose broad market-overview tools on those decision types.
         tools = self._tools.get_tool_descriptions()
+        decision_type = self._decision_type_from_messages(messages)
+        if decision_type in ("full_decision", "light_decision"):
+            tools = [
+                tool for tool in tools
+                if tool.get("function", {}).get("name") != "query_market_overview"
+            ]
 
         for attempt in range(3):
             try:
@@ -326,7 +429,9 @@ class AgentRunner(IAgentRunner):
 
         return "", None, 0, 0, ""
 
-    def _execute_tool_calls(self, tool_calls: list[dict], timestamp: str) -> tuple[str, list[dict]]:
+    def _execute_tool_calls(
+        self, tool_calls: list[dict], timestamp: str, messages: list[dict] | None = None,
+    ) -> tuple[str, list[dict]]:
         """Execute tool calls and return formatted results + tool call records.
 
         Returns:
@@ -335,6 +440,7 @@ class AgentRunner(IAgentRunner):
         """
         lines = ["[TOOL_RESULT]"]
         records = []
+        decision_type = self._decision_type_from_messages(messages or [])
         for tc in tool_calls:
             func = tc.get("function", {})
             name = func.get("name", "")
@@ -344,7 +450,10 @@ class AgentRunner(IAgentRunner):
                 args = {}
 
             start_time = time.time()
-            result = self._tools.execute_tool(name, args, timestamp)
+            if name == "query_market_overview" and decision_type in ("full_decision", "light_decision"):
+                result = "query_market_overview denied: current MARKET_SUMMARY already provides breadth and open status for full/light decisions."
+            else:
+                result = self._tools.execute_tool(name, args, timestamp)
             latency = (time.time() - start_time) * 1000
 
             records.append({

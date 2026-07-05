@@ -220,12 +220,13 @@ class PortfolioEngine(IPortfolioEngine):
                 return result
             self._constraints._sells_this_decision += 1
 
-        # 2. Daily trade limit (only BUYs count toward limit; SELLs always allowed)
-        ok, reason = self._constraints.check_daily_limit(timestamp)
-        if not ok:
-            result = TradeResult(order=order, success=False, error=f"limit: {reason}")
-            self._trade_history.append(result)
-            return result
+        # 2. Daily BUY limit; SELLs remain allowed for risk reduction.
+        if order.side == OrderSide.BUY:
+            ok, reason = self._constraints.check_daily_limit(timestamp)
+            if not ok:
+                result = TradeResult(order=order, success=False, error=f"limit: {reason}")
+                self._trade_history.append(result)
+                return result
 
         # 2. Market rules check
         can_trade, rule_reason = self._market_rules.can_trade(

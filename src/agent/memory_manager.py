@@ -132,15 +132,23 @@ class MemoryManager:
             return plan
 
         if plan_action == PlanAction.CREATE:
-            return self.create_plan(
+            plan = self.create_plan(
                 symbol, current_price, note, timestamp, triggers,
             )
+            if note:
+                plan.plan_note = note
+            plan.intended_horizon_bars = intended_horizon_bars
+            return plan
 
         if plan is None:
             # Create new plan if doesn't exist
-            return self.create_plan(
+            plan = self.create_plan(
                 symbol, current_price, note, timestamp, triggers,
             )
+            if note:
+                plan.plan_note = note
+            plan.intended_horizon_bars = intended_horizon_bars
+            return plan
 
         if plan_action == PlanAction.UPDATE:
             plan.plan_version += 1
@@ -336,90 +344,86 @@ class MemoryManager:
     def apply_plan_updates(self, updates: list[dict], timestamp: str = "") -> None:
         """Apply plan_updates from LLM output.
 
-        Expected format:
-        [
-            {"symbol": "AAPL.US", "action": "create", "stop_loss": 150, "take_profit": 180},
-            {"symbol": "TSLA.US", "action": "update", "stop_loss": 200},
-            {"symbol": "NVDA.US", "action": "close"},
-        ]
+        Supports both the structured v3 format:
+            {"symbol": "AAPL.US", "plan_action": "update", "triggers": [...], "plan_note": "..."}
+        and the older shorthand format:
+            {"symbol": "AAPL.US", "action": "update", "stop_loss": 150, "take_profit": 180}
         """
         if not updates:
             return
 
         for update in updates:
-            symbol = update.get("symbol", "")
-            action = update.get("action", "").lower()
-
-            if not symbol or not action:
+            if not isinstance(update, dict):
                 continue
 
-            if action == "create":
-                # Create new plan
-                stop_loss = update.get("stop_loss")
-                take_profit = update.get("take_profit")
-                note = update.get("note", "")
-                triggers = []
-                if stop_loss:
-                    triggers.append(PlanTrigger(
-                        trigger_type=TriggerType.PRICE_MOVE_PCT,
-                        threshold=stop_loss,
-                        direction="below",
-                    ))
-                if take_profit:
-                    triggers.append(PlanTrigger(
-                        trigger_type=TriggerType.PRICE_MOVE_PCT,
-                        threshold=take_profit,
-                        direction="above",
-                    ))
-                self.create_plan(
-                    symbol=symbol,
-                    action=PlanAction.CREATE,
-                    triggers=triggers,
-                    note=note,
-                    timestamp=timestamp,
-                )
+            symbol = update.get("symbol", "")
+            if not symbol:
+                continue
 
-            elif action == "update":
-                # Update existing plan
-                plan = self._plans.get(symbol)
-                if plan:
-                    if "stop_loss" in update:
-                        # Update or add stop loss trigger
-                        for t in plan.triggers:
-                            if t.trigger_type == TriggerType.PRICE_MOVE_PCT and t.direction == "below":
-                                t.threshold = update["stop_loss"]
-                                break
-                        else:
-                            plan.triggers.append(PlanTrigger(
-                                trigger_type=TriggerType.PRICE_MOVE_PCT,
-                                threshold=update["stop_loss"],
-                                direction="below",
-                            ))
-                    if "take_profit" in update:
-                        # Update or add take profit trigger
-                        for t in plan.triggers:
-                            if t.trigger_type == TriggerType.PRICE_MOVE_PCT and t.direction == "above":
-                                t.threshold = update["take_profit"]
-                                break
-                        else:
-                            plan.triggers.append(PlanTrigger(
-                                trigger_type=TriggerType.PRICE_MOVE_PCT,
-                                threshold=update["take_profit"],
-                                direction="above",
-                            ))
-                    if "note" in update:
-                        plan.note = update["note"]
-                    plan.last_review_time = timestamp
+            action = self._parse_plan_action(update.get("plan_action", update.get("action", "no_change")))
+            triggers = self._parse_plan_triggers(update.get("triggers", []))
+            note = update.get("plan_note", update.get("note", "")) or ""
+            legacy_levels = self._format_legacy_plan_levels(update)
+            if legacy_levels:
+                note = f"{note}; {legacy_levels}" if note else legacy_levels
+            intended_horizon_bars = update.get("intended_horizon_bars", 36)
+            current_price = update.get("current_price", update.get("entry_price", 0.0)) or 0.0
 
-            elif action == "close":
-                # Close plan
-                self.close_plan(symbol, timestamp)
+            self.update_plan(
+                symbol=symbol,
+                plan_action=action,
+                triggers=triggers or None,
+                note=note,
+                intended_horizon_bars=intended_horizon_bars,
+                timestamp=timestamp,
+                current_price=float(current_price),
+            )
 
-            elif action == "no_change":
-                # Just update review time
-                plan = self._plans.get(symbol)
-                if plan:
-                    plan.last_review_time = timestamp
+    @staticmethod
+    def _parse_plan_action(raw_action) -> PlanAction:
+        if isinstance(raw_action, PlanAction):
+            return raw_action
+        try:
+            return PlanAction(str(raw_action).lower())
+        except ValueError:
+            return PlanAction.NO_CHANGE
+
+    @staticmethod
+    def _parse_plan_triggers(raw_triggers) -> list[PlanTrigger]:
+        triggers: list[PlanTrigger] = []
+        for raw in raw_triggers or []:
+            if isinstance(raw, PlanTrigger):
+                triggers.append(raw)
+                continue
+            if not isinstance(raw, dict):
+                continue
+            trigger_type = raw.get("trigger_type", raw.get("type", ""))
+            try:
+                parsed_type = TriggerType(trigger_type)
+            except ValueError:
+                continue
+            triggers.append(PlanTrigger(
+                trigger_type=parsed_type,
+                direction=raw.get("direction", ""),
+                anchor=raw.get("anchor", ""),
+                threshold_pct=raw.get("threshold_pct", 0.0) or 0.0,
+                atr_multiple=raw.get("atr_multiple", 0.0) or 0.0,
+                operator=raw.get("operator", ""),
+                since=raw.get("since", ""),
+                bars=raw.get("bars", 0) or 0,
+                peak_anchor=raw.get("peak_anchor", ""),
+                atr_source=raw.get("atr_source", ""),
+            ))
+        return triggers
+
+    @staticmethod
+    def _format_legacy_plan_levels(update: dict) -> str:
+        parts = []
+        if "stop_loss" in update:
+            parts.append(f"legacy_stop_loss={update['stop_loss']}")
+        if "take_profit" in update:
+            parts.append(f"legacy_take_profit={update['take_profit']}")
+        return ", ".join(parts)
 
     # --- Recent Activity ---
 

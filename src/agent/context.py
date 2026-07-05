@@ -140,6 +140,7 @@ class ContextBuilder(IContextBuilder):
         bar_index: int,
         round_num: int,
         tool_results: str = "",
+        decision_type: str = "full_decision",
     ) -> list[dict[str, str]]:
         """Build full decision prompt (v3 style).
 
@@ -177,7 +178,7 @@ class ContextBuilder(IContextBuilder):
 
         # --- DECISION_CONTEXT ---
         user_blocks.append(self._format_decision_context(
-            timestamp, "full_decision", open_markets, closed_markets,
+            timestamp, decision_type, open_markets, closed_markets,
             benchmark_day, bar_index,
         ))
         user_blocks.append("")
@@ -528,7 +529,7 @@ Avoid trades where expected edge < transaction costs."""
     ) -> str:
         """Build market summary from ALL stocks in each market (full universe).
 
-        Fields: Market|Open|Regime|TradeAllowed|Universe1H|Universe1D|Breadth|Vol
+        Fields: Market|Open|TradeAllowed|Universe1H|Universe1D|Breadth|Vol
 
         Args:
             index_returns: {Market: {"symbol": str, "return_1h": float, "return_1d": float}}
@@ -923,4 +924,7 @@ Avoid trades where expected edge < transaction costs."""
         lines.append(f'bar_index: {bar_index}')
         lines.append(f'open_markets: {open_markets}')
         lines.append(f'closed_markets: {closed_markets}')
+        if decision_type == "light_decision":
+            lines.append("scope: 24h_assets_only")
+            lines.append("allowed_trade_markets: ['CRYPTO']")
         return "\n".join(lines)
