@@ -22,6 +22,7 @@ from src.core.interfaces import IToolSystem
 from src.data.provider import MarketDataProvider
 from src.data.features import FeatureGenerator
 from src.data.futures_resolver import FuturesContractResolver
+from src.core.futures_specs import get_futures_family_spec, get_futures_product_spec
 
 
 # Tool schemas for function calling
@@ -215,7 +216,27 @@ TOOL_SCHEMAS = [
             },
         },
     },
-]
+    {
+        "type": "function",
+        "function": {
+            "name": "query_futures_family",
+            "description": "Query a futures exposure family with signal contract and standard/micro tradable variants. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Futures family symbol such as GOLD_FUT or OIL_FUT"},
+                    "fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["signal", "signal_features", "pilot_target_pct_nav", "tradable_variants", "roll_status", "risk", "current_family_exposure"],
+                        },
+                    },
+                },
+                "required": ["symbol"],
+            },
+        },
+    },]
 
 
 class ToolSystem(IToolSystem):
@@ -256,9 +277,107 @@ class ToolSystem(IToolSystem):
             return self._query_fx(args, timestamp)
         elif name == "query_futures_contract":
             return self._query_futures_contract(args, timestamp)
+        elif name == "query_futures_family":
+            return self._query_futures_family(args, timestamp)
         else:
             return f"Unknown tool: {name}"
 
+
+    def _query_futures_family(self, args: dict, timestamp: str) -> str:
+        """Query family-level futures variants for the model."""
+        family_symbol = args.get("symbol", "GOLD_FUT")
+        fields = set(args.get("fields") or [])
+        family = get_futures_family_spec(family_symbol)
+        if family is None or self._futures_resolver is None:
+            return json.dumps({"symbol": family_symbol, "error": "unknown futures family"}, ensure_ascii=False)
+
+        variants = []
+        signal = None
+        signal_features = None
+        for symbol in family.variants:
+            product = get_futures_product_spec(symbol)
+            resolved = self._futures_resolver.resolve(symbol, timestamp)
+            item = {
+                "variant": product.variant if product else "standard",
+                "symbol": symbol,
+                "actual_contract": resolved.contract_ticker,
+                "price": resolved.price,
+                "multiplier": resolved.multiplier,
+                "one_contract_notional_usd": resolved.notional_per_contract,
+                "initial_margin_usd": resolved.initial_margin,
+                "roll_status": resolved.roll_status,
+                "days_to_expiry": resolved.days_to_expiry,
+                "previous_session_dollar_volume": resolved.previous_session_dollar_volume,
+                "tradable": bool(resolved.contract_ticker and resolved.price),
+                "selection_method": resolved.selection_method,
+            }
+            variants.append(item)
+            if item["tradable"] and (signal is None or (item["previous_session_dollar_volume"] or 0) > (signal.get("previous_session_dollar_volume") or 0)):
+                signal = item
+                signal_features = self._futures_signal_features(symbol, resolved.contract_ticker, timestamp)
+
+        pilot_target_pct_nav = self._futures_pilot_target_pct_nav(variants)
+
+        snapshot = self._get_snapshot()
+        positions = []
+        if snapshot is not None:
+            for pos in getattr(snapshot, "futures_positions", {}).values():
+                product = get_futures_product_spec(pos.continuous_symbol)
+                if product and product.family_symbol == family.family_symbol:
+                    positions.append({
+                        "execution_symbol": pos.continuous_symbol,
+                        "actual_contract": pos.contract_ticker,
+                        "side": pos.side,
+                        "contracts": pos.contracts,
+                        "notional_usd": pos.notional,
+                        "margin_locked": pos.margin_locked,
+                    })
+        payload = {
+            "symbol": family.family_symbol,
+            "underlying": family.underlying,
+            "signal": signal,
+            "signal_features": signal_features,
+            "pilot_target_pct_nav": pilot_target_pct_nav,
+            "tradable_variants": variants,
+            "current_family_exposure": {"positions": positions},
+            "risk": {"risk_note": "standard and micro variants are the same family view; execution auto-selects one variant"},
+        }
+        if fields:
+            keep = {"symbol", "underlying"} | fields
+            payload = {k: v for k, v in payload.items() if k in keep}
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _futures_signal_features(self, symbol: str, contract: str, timestamp: str) -> dict | None:
+        if not contract:
+            return None
+        bars = self._data.load_futures_bars(symbol, contract, "2025-10-01", timestamp)
+        snap = self._features.compute(bars, timestamp)
+        if snap is None:
+            return None
+        return {
+            "trend": snap.trend,
+            "setup": snap.setup,
+            "recent_score": snap.recent_score,
+            "rsi": round(snap.rsi, 1),
+            "chg_1h_pct": round(snap.chg_1h, 2),
+            "chg_1d_pct": round(snap.chg_1d, 2),
+            "ret_30m_pct": round(snap.ret_30m, 2),
+            "atr_pct": round(snap.atr_pct, 2),
+        }
+
+    def _futures_pilot_target_pct_nav(self, variants: list[dict]) -> float:
+        snapshot = self._get_snapshot()
+        nav = getattr(snapshot, "total_nav", 0.0) if snapshot is not None else 0.0
+        notionals = [
+            float(item["one_contract_notional_usd"])
+            for item in variants
+            if item.get("tradable") and item.get("one_contract_notional_usd")
+        ]
+        if nav <= 0 or not notionals:
+            return 0.0
+        import math
+        raw = min(notionals) / nav * 1.05
+        return min(0.10, max(0.01, math.ceil(raw * 100) / 100))
 
     def _query_futures_contract(self, args: dict, timestamp: str) -> str:
         """Query point-in-time actual contract mapping and futures risk metadata."""

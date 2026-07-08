@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 from src.core.config import Config
+from src.core.futures_specs import get_futures_family_spec, get_futures_product_spec, is_futures_family_symbol, futures_symbol_allowed
 from src.core.types import (
     FuturesMarkResult,
     FuturesPosition,
@@ -47,7 +48,7 @@ class FuturesAccount:
     def process_order(self, order: TradeOrder, timestamp: str) -> TradeResult:
         if order.market != Market.FUTURES or order.asset_type != "futures":
             return self._reject(order, "not a futures order")
-        if order.symbol not in self._config.futures.allowed_symbols:
+        if not futures_symbol_allowed(order.symbol, self._config.futures.allowed_symbols) and not is_futures_family_symbol(order.symbol):
             return self._reject(order, "futures symbol not allowed")
 
         action = (order.action or "").upper()
@@ -199,11 +200,15 @@ class FuturesAccount:
         if order.futures_side == "short" and not self._config.futures.allow_short:
             return self._reject(order, "short futures disabled")
 
-        resolved = self._resolver.resolve(order.symbol, timestamp)
+        execution_symbol, sizing_method, reject_reason = self._select_execution_symbol(order, timestamp, roll=roll)
+        if reject_reason:
+            return self._reject(order, reject_reason)
+
+        resolved = self._resolver.resolve(execution_symbol, timestamp)
         if not resolved.contract_ticker or resolved.price is None or not resolved.notional_per_contract:
             return self._reject(order, "no active futures contract")
 
-        exec_bar = self._data.get_next_executable_futures_bar(order.symbol, resolved.contract_ticker, timestamp)
+        exec_bar = self._data.get_next_executable_futures_bar(execution_symbol, resolved.contract_ticker, timestamp)
         if exec_bar is None:
             return self._reject(order, "no next executable futures bar")
 
@@ -224,10 +229,18 @@ class FuturesAccount:
         target_contracts = math.floor(abs(target_notional_usd) / notional_per_contract)
         if target_contracts < 1 and roll:
             target_contracts = 1
+        if target_contracts < 1 and is_futures_family_symbol(order.symbol):
+            min_lot_tolerance = 0.85
+            if abs(target_notional_usd) >= notional_per_contract * min_lot_tolerance:
+                target_contracts = 1
         if target_contracts < 1:
             return self._reject(order, "target_notional_too_small_for_one_contract")
-        if target_contracts > self._config.futures.max_contracts_per_symbol:
-            return self._reject(order, "max_contracts_per_symbol_exceeded")
+        max_contracts = self._config.futures.max_contracts_per_symbol
+        if target_contracts > max_contracts:
+            if is_futures_family_symbol(order.symbol):
+                target_contracts = max_contracts
+            else:
+                return self._reject(order, "max_contracts_per_symbol_exceeded")
 
         required_margin = target_contracts * resolved.initial_margin
         max_margin_pct = order.max_margin_pct_nav or self._config.futures.max_margin_pct_nav
@@ -239,7 +252,7 @@ class FuturesAccount:
             return self._reject(order, "total_futures_margin_cap_exceeded")
 
         risk_budget_pct = order.risk_budget_pct_nav or self._config.futures.max_risk_budget_pct_nav
-        adverse_loss = target_contracts * resolved.multiplier * self._estimate_atr_price_move(order.symbol, resolved.contract_ticker, timestamp, fill_price)
+        adverse_loss = target_contracts * resolved.multiplier * self._estimate_atr_price_move(execution_symbol, resolved.contract_ticker, timestamp, fill_price)
         if adverse_loss > self.nav * risk_budget_pct:
             return self._reject(order, "risk_budget_exceeded")
 
@@ -253,7 +266,7 @@ class FuturesAccount:
 
         self.cash_usd -= commission
         pos = FuturesPosition(
-            continuous_symbol=order.symbol,
+            continuous_symbol=execution_symbol,
             contract_ticker=resolved.contract_ticker,
             side=side,
             contracts=target_contracts,
@@ -261,6 +274,7 @@ class FuturesAccount:
             previous_mark_price=fill_price,
             current_price=fill_price,
             multiplier=resolved.multiplier,
+            tick_size=resolved.tick_size,
             initial_margin_per_contract=resolved.initial_margin,
             maintenance_margin_per_contract=resolved.maintenance_margin,
             margin_locked=required_margin,
@@ -289,8 +303,13 @@ class FuturesAccount:
             cost=notional_per_contract * target_contracts,
             fees=commission,
             metadata={
+                "requested_symbol": order.symbol,
+                "execution_symbol": execution_symbol,
+                "variant": (get_futures_product_spec(execution_symbol).variant if get_futures_product_spec(execution_symbol) else "standard"),
+                "sizing_method": sizing_method,
                 "actual_contract": resolved.contract_ticker,
                 "notional_per_contract": notional_per_contract,
+                "tick_size": resolved.tick_size,
                 "margin_locked": required_margin,
                 "roll_status": resolved.roll_status,
                 "selection_method": resolved.selection_method,
@@ -302,12 +321,78 @@ class FuturesAccount:
         self.margin_state = self._compute_margin_state()
         return result
 
+    def _select_execution_symbol(self, order: TradeOrder, timestamp: str, roll: bool = False) -> tuple[str, str, str]:
+        """Select standard or micro variant for a family-level futures order."""
+        if not is_futures_family_symbol(order.symbol):
+            return order.symbol, "direct_contract", ""
+
+        family = get_futures_family_spec(order.symbol)
+        if family is None:
+            return order.symbol, "", "unknown_futures_family"
+        target_notional_pct = order.target_notional_pct_nav
+        if target_notional_pct is None or target_notional_pct <= 0:
+            return order.symbol, "", "missing target_notional_pct_nav"
+
+        target_notional_usd = self.nav * target_notional_pct
+        candidates = []
+        min_valid = None
+        for symbol in family.variants:
+            resolved = self._resolver.resolve(symbol, timestamp)
+            if not resolved.contract_ticker or resolved.price is None or not resolved.notional_per_contract:
+                continue
+            exec_bar = self._data.get_next_executable_futures_bar(symbol, resolved.contract_ticker, timestamp)
+            if exec_bar is None:
+                continue
+            side = order.futures_side or "long"
+            slip = self._config.futures.slippage_bps / 10_000
+            fill_multiplier = 1 - slip if side == "short" else 1 + slip
+            base_price = exec_bar.open if self._config.futures.execution_price_mode == "next_bar_open" else exec_bar.close
+            fill_price = self._round_to_tick(base_price * fill_multiplier, resolved.tick_size)
+            notional_per_contract = fill_price * resolved.multiplier
+            min_valid = min(min_valid or notional_per_contract, notional_per_contract)
+            contracts = math.floor(abs(target_notional_usd) / notional_per_contract)
+            if contracts < 1 and roll:
+                contracts = 1
+            if contracts < 1:
+                min_lot_tolerance = 0.85
+                if abs(target_notional_usd) >= notional_per_contract * min_lot_tolerance:
+                    contracts = 1
+            if contracts < 1:
+                continue
+            contracts = min(contracts, self._config.futures.max_contracts_per_symbol)
+            required_margin = contracts * resolved.initial_margin
+            max_margin_pct = order.max_margin_pct_nav or self._config.futures.max_margin_pct_nav
+            actual_notional = notional_per_contract * contracts
+            if required_margin > self.nav * max_margin_pct:
+                continue
+            if actual_notional > self.nav * self._config.futures.max_abs_notional_pct_nav:
+                continue
+            if required_margin + self.margin_locked > self.nav * self._config.futures.max_total_margin_pct_nav:
+                continue
+            risk_budget_pct = order.risk_budget_pct_nav or self._config.futures.max_risk_budget_pct_nav
+            adverse_loss = contracts * resolved.multiplier * self._estimate_atr_price_move(symbol, resolved.contract_ticker, timestamp, fill_price)
+            if adverse_loss > self.nav * risk_budget_pct:
+                continue
+            product = get_futures_product_spec(symbol)
+            variant = product.variant if product else "standard"
+            actual_pct = actual_notional / self.nav if self.nav > 0 else 0.0
+            margin_pct = required_margin / self.nav if self.nav > 0 else 0.0
+            candidates.append((abs(actual_pct - target_notional_pct), margin_pct, -(resolved.previous_session_dollar_volume or 0.0), contracts, symbol, variant))
+
+        if not candidates:
+            if min_valid:
+                min_pct = min_valid / self.nav if self.nav > 0 else 0.0
+                return order.symbol, "", f"target_notional_too_small_for_one_contract:min_valid_target_notional_pct_nav={min_pct:.4f}"
+            return order.symbol, "", "no_valid_contract_size"
+
+        _, _, _, _, symbol, variant = sorted(candidates)[0]
+        return symbol, f"auto_{variant}_closest_to_target", ""
     def _close(self, order: TradeOrder, timestamp: str, forced: bool = False, roll: bool = False) -> TradeResult:
         key = f"FUTURES:{order.symbol}"
         pos = self.positions.get(key)
         if pos is None:
             return self._reject(order, "no futures position to close")
-        exec_bar = self._data.get_next_executable_futures_bar(order.symbol, pos.contract_ticker, timestamp)
+        exec_bar = self._data.get_next_executable_futures_bar(pos.continuous_symbol, pos.contract_ticker, timestamp)
         if exec_bar is None:
             return self._reject(order, "no next executable futures bar")
         base_price = exec_bar.open if self._config.futures.execution_price_mode == "next_bar_open" else exec_bar.close
@@ -315,7 +400,7 @@ class FuturesAccount:
         fill_multiplier = 1 + slip if pos.side == "short" else 1 - slip
         fill_price = self._round_to_tick(
             base_price * fill_multiplier,
-            self._config.futures.gc_tick_size,
+            pos.tick_size,
         )
         pnl_delta = pos.side_sign * pos.contracts * pos.multiplier * (fill_price - pos.previous_mark_price)
         commission = pos.contracts * self._config.futures.commission_per_contract
@@ -340,8 +425,12 @@ class FuturesAccount:
             cost=fill_price * pos.multiplier * pos.contracts,
             fees=commission,
             metadata={
+                "requested_symbol": order.symbol,
+                "execution_symbol": pos.continuous_symbol,
+                "variant": (get_futures_product_spec(pos.continuous_symbol).variant if get_futures_product_spec(pos.continuous_symbol) else "standard"),
                 "actual_contract": pos.contract_ticker,
                 "released_margin": released_margin,
+                "tick_size": pos.tick_size,
                 "pnl_delta": pnl_delta,
                 "forced_liquidation": forced,
                 "roll_trade": roll,

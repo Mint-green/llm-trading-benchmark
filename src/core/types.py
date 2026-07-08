@@ -344,6 +344,11 @@ class CandidateInBucket:
     roll_status: str = ""
     days_to_expiry: int = 0
     liquidity_note: str = ""
+    signal_symbol: str = ""
+    standard_variant: str = ""
+    micro_variant: str = ""
+    execution_guidance: str = ""
+    pilot_target_pct_nav: float = 0.0
 
 
 @dataclass
@@ -439,6 +444,7 @@ class FuturesPosition:
     previous_mark_price: float
     current_price: float
     multiplier: float
+    tick_size: float
     initial_margin_per_contract: float
     maintenance_margin_per_contract: float
     margin_locked: float

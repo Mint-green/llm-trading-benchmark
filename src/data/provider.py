@@ -31,7 +31,7 @@ class MarketDataProvider(IMarketDataProvider):
     def _get_conn(self, market: Market) -> sqlite3.Connection:
         if market not in self._connections:
             path = self._config.db_paths[market]
-            self._connections[market] = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            self._connections[market] = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
         return self._connections[market]
 
     def close(self) -> None:

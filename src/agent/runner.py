@@ -3,8 +3,8 @@ AgentRunner — manages multi-round decision flow with LLM.
 
 Flow per timestamp:
   Round 1: Receive full context
-  Rounds 2-3: Use tools (function calling)
-  Round 4: Mandatory decision (JSON only)
+  Round 2: Use tools (function calling)
+  Round 3: Mandatory decision (JSON only) for v3 full/light decisions
 
 Supports two modes:
   1. Legacy mode: prompt-based tool calls (query action)
@@ -85,8 +85,10 @@ class AgentRunner(IAgentRunner):
             })
         final_decision = Decision(action="hold", reason="max rounds reached")
         use_tools = pre_built_messages is not None  # Enable function calling for v3 mode
+        decision_type = self._decision_type_from_messages(base_messages or [])
+        effective_max_rounds = self._effective_max_rounds(decision_type)
 
-        for round_num in range(1, self._config.max_agent_rounds + 1):
+        for round_num in range(1, effective_max_rounds + 1):
             start_time = time.time()
 
             # Build context
@@ -97,7 +99,7 @@ class AgentRunner(IAgentRunner):
                 if tool_history:
                     messages.append({"role": "user", "content": "\n\n".join(tool_history)})
 
-                max_r = self._config.max_agent_rounds
+                max_r = effective_max_rounds
                 if round_num >= max_r:
                     instruction = self._context._loader.load_final_round_instruction()
                 else:
@@ -113,7 +115,7 @@ class AgentRunner(IAgentRunner):
                 )
 
             # Call LLM (with or without tools)
-            if use_tools and round_num < self._config.max_agent_rounds:
+            if use_tools and round_num < effective_max_rounds:
                 response_text, tool_calls, prompt_tokens, completion_tokens, reasoning = self._call_llm_with_tools(messages)
             else:
                 response_text, prompt_tokens, completion_tokens, reasoning = self._call_llm(messages)
@@ -178,7 +180,7 @@ class AgentRunner(IAgentRunner):
                 final_decision = self._finalize_trade_decision(decision, snapshot, timestamp)
                 break
 
-            elif decision.action == "query" and round_num < self._config.max_agent_rounds:
+            elif decision.action == "query" and round_num < effective_max_rounds:
                 # Execute queries (legacy mode)
                 tool_results = self._execute_queries(decision.queries, timestamp)
                 continue
@@ -203,8 +205,11 @@ class AgentRunner(IAgentRunner):
             resolved_trades, snapshot, timestamp,
         )
         resolved_trades, lot_filter_reason = self._filter_zero_lot_buys(resolved_trades)
+        resolved_trades, buy_filter_reason = self._filter_constraint_blocked_buys(
+            resolved_trades, snapshot,
+        )
         reason = decision.reason
-        for extra_reason in (filter_reason, lot_filter_reason):
+        for extra_reason in (filter_reason, lot_filter_reason, buy_filter_reason):
             if extra_reason:
                 reason = f"{reason} | {extra_reason}".strip()
 
@@ -296,6 +301,43 @@ class AgentRunner(IAgentRunner):
             return trades, ""
         return filtered, f"filtered {len(blocked)} cooling-blocked SELL(s): {', '.join(blocked)}"
 
+    def _filter_constraint_blocked_buys(
+        self, trades: list[TradeOrder], snapshot: PortfolioSnapshot,
+    ) -> tuple[list[TradeOrder], str]:
+        """Drop BUY orders that current portfolio constraints would reject."""
+        if not trades or self._portfolio is None:
+            return trades, ""
+
+        constraints = getattr(self._portfolio, "_constraints", None)
+        if constraints is None:
+            return trades, ""
+
+        filtered: list[TradeOrder] = []
+        blocked = []
+        for trade in trades:
+            if trade.side != OrderSide.BUY or trade.market == Market.FUTURES or trade.asset_type == "futures":
+                filtered.append(trade)
+                continue
+
+            price = self._get_price_from_snapshot(trade.symbol, trade.market, snapshot)
+            if price is None or price <= 0:
+                filtered.append(trade)
+                continue
+
+            to_usd = getattr(self._portfolio, "_to_usd", None)
+            constraint_price = to_usd(price, trade.market) if to_usd else price
+            ok, reason = constraints.validate_buy(
+                trade.symbol, trade.market, trade.quantity, constraint_price,
+                snapshot.total_nav, snapshot.positions,
+            )
+            if not ok:
+                blocked.append(f"{trade.symbol}({trade.market.value}: {reason})")
+                continue
+            filtered.append(trade)
+
+        if not blocked:
+            return trades, ""
+        return filtered, f"filtered {len(blocked)} constraint-blocked BUY(s): {', '.join(blocked)}"
     def _filter_zero_lot_buys(self, trades: list[TradeOrder]) -> tuple[list[TradeOrder], str]:
         """Drop BUY orders that execution lot rounding would reduce to zero."""
         if not trades or self._portfolio is None:
@@ -322,6 +364,14 @@ class AgentRunner(IAgentRunner):
         if not blocked:
             return trades, ""
         return filtered, f"filtered {len(blocked)} zero-lot BUY(s): {', '.join(blocked)}"
+
+    def _effective_max_rounds(self, decision_type: str) -> int:
+        """Cap v3 decisions by type to control latency and exploratory churn."""
+        if decision_type == "light_decision":
+            return 1
+        if decision_type == "full_decision":
+            return min(self._config.max_agent_rounds, self._config.full_decision_max_rounds)
+        return self._config.max_agent_rounds
 
     @staticmethod
     def _decision_type_from_messages(messages: list[dict]) -> str:

@@ -125,6 +125,7 @@ class ExperimentRunner:
         # Risk mode
         self._risk_mode = RiskMode.GREEN
         self._stop_loss_buy_pause_until: dict[Market, str] = {}
+        self._stop_loss_recent_by_market: dict[Market, list[str]] = {}
         self._pending_daily_summary_injection = False
         self._logged_futures_roll_count = 0
         self._logged_futures_trade_count = 0
@@ -310,7 +311,7 @@ class ExperimentRunner:
             # Crypto-only period: schedule light_decision at lower frequency
             if not has_stock_market:
                 # Check if it's time for a light_decision.
-                light_interval = 60 if has_24h_position else 240  # 1h or 4h
+                light_interval = 240  # 4h watch cadence; 5min scanner handles hard stops
                 if self._is_light_decision_boundary(ts, light_interval):
                     if not self._last_light_decision or \
                        self.scheduler._minutes_since(ts, self._last_light_decision) >= light_interval:
@@ -578,7 +579,7 @@ class ExperimentRunner:
                 _t_llm += _time.time() - _t_llm_start
                 if decision_request.decision_type == DecisionType.LIGHT_DECISION:
                     decision = self._restrict_light_decision_trades(
-                        decision, allow_new_24h_buys=has_24h_position,
+                        decision, allow_new_24h_buys=False,
                     )
                 decision = self._filter_stop_loss_cooldown_buys(decision, ts)
                 all_rounds.extend(rounds)
@@ -688,8 +689,17 @@ class ExperimentRunner:
                                 "error": "price unavailable",
                             })
 
-                    # Only retry if there are FAILED trades (not just ADJUSTED)
-                    if not has_failures or attempt == 1:
+                    retry_failures = (
+                        has_failures and self._should_retry_trade_failures(feedback_results)
+                    )
+                    if has_failures and not retry_failures:
+                        decision = self._append_trade_feedback_to_reason(
+                            decision,
+                            ContextBuilder.build_trade_feedback(feedback_results),
+                        )
+
+                    # Only retry if there are repairable FAILED trades (not just ADJUSTED).
+                    if not has_failures or attempt == 1 or not retry_failures:
                         break
 
                     trade_feedback = ContextBuilder.build_trade_feedback(feedback_results)
@@ -699,7 +709,7 @@ class ExperimentRunner:
                     break
 
             # Log
-            self.logger.log_decision(ts, decision, snapshot)
+            self.logger.log_decision(ts, decision, snapshot, decision_request.decision_type.value)
             self.logger.log_snapshot(self.portfolio.get_snapshot(ts))
             portfolio_history.append(self.portfolio.get_snapshot(ts))
 
@@ -850,7 +860,7 @@ class ExperimentRunner:
 
         self.logger.save_results(result)
         self.logger.mark_completed()
-        self.logger.close()
+        self._close_resources()
 
         # Print summary
         print("\n" + "=" * 60)
@@ -871,6 +881,29 @@ class ExperimentRunner:
         print("=" * 60)
 
         return result
+
+    def _close_resources(self) -> None:
+        """Close DB/API resources so benchmark processes can exit promptly."""
+        for obj in (
+            getattr(self, "logger", None),
+            getattr(self, "data_provider", None),
+            getattr(self, "fx_provider", None),
+            getattr(self, "index_provider", None),
+        ):
+            close = getattr(obj, "close", None)
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception:
+                pass
+        client = getattr(getattr(self, "agent", None), "_client", None)
+        close = getattr(client, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
 
     def _all_trade_history(self) -> list[TradeResult]:
         """Return execution history across spot/stock portfolio and futures account."""
@@ -1004,8 +1037,6 @@ class ExperimentRunner:
         """Return True once after a daily summary is saved for prompt injection."""
         pending = getattr(self, "_pending_daily_summary_injection", False)
         self._pending_daily_summary_injection = False
-        self._logged_futures_roll_count = 0
-        self._logged_futures_trade_count = 0
         return pending
 
     @staticmethod
@@ -1094,12 +1125,26 @@ class ExperimentRunner:
         return (not ok) and reason.startswith("cooling period")
 
     def _record_stop_loss_buy_pause(self, market: Market, timestamp: str) -> None:
-        """Pause same-market new BUYs briefly after deterministic stop-loss."""
+        """Pause same-market new BUYs after deterministic stop-loss.
+
+        A single stop-loss gets a short pause. Clustered stop-losses in the same
+        market extend the pause to reduce same-session replacement churn.
+        """
         from datetime import datetime, timedelta
 
-        until = (
-            datetime.strptime(timestamp, "%Y-%m-%d %H:%M") + timedelta(minutes=60)
-        ).strftime("%Y-%m-%d %H:%M")
+        now = datetime.strptime(timestamp, "%Y-%m-%d %H:%M")
+        recent_by_market = getattr(self, "_stop_loss_recent_by_market", {})
+        recent = []
+        for ts in recent_by_market.get(market, []):
+            then = datetime.strptime(ts, "%Y-%m-%d %H:%M")
+            if now - then <= timedelta(minutes=180):
+                recent.append(ts)
+        recent.append(timestamp)
+        recent_by_market[market] = recent[-5:]
+        self._stop_loss_recent_by_market = recent_by_market
+
+        pause_minutes = 180 if len(recent) >= 2 else 60
+        until = (now + timedelta(minutes=pause_minutes)).strftime("%Y-%m-%d %H:%M")
         current_until = self._stop_loss_buy_pause_until.get(market)
         if current_until is None or current_until < until:
             self._stop_loss_buy_pause_until[market] = until
@@ -1150,13 +1195,46 @@ class ExperimentRunner:
         )
 
     @staticmethod
+    def _should_retry_trade_failures(feedback_results: list[dict]) -> bool:
+        """Retry only failures that can plausibly be repaired by another LLM pass."""
+        hard_reject_prefixes = (
+            "target_notional_too_small_for_one_contract",
+            "one_contract_exceeds_abs_notional_cap",
+            "one_contract_exceeds_margin_cap",
+            "one_contract_exceeds_risk_budget",
+            "max_contracts_exceeded",
+            "futures_symbol_not_allowed",
+            "no_active_contract",
+        )
+        for item in feedback_results:
+            if item.get("type") != "failed":
+                continue
+            error = str(item.get("error", ""))
+            if not error.startswith(hard_reject_prefixes):
+                return True
+        return False
+
+    @staticmethod
+    def _append_trade_feedback_to_reason(decision: Decision, feedback: str) -> Decision:
+        if not feedback.strip():
+            return decision
+        return Decision(
+            action=decision.action,
+            trades=decision.trades,
+            queries=decision.queries,
+            reason=f"{decision.reason} | execution feedback: {feedback}".strip(),
+            memory_updates=decision.memory_updates,
+            plan_updates=decision.plan_updates,
+        )
+
+    @staticmethod
     def _restrict_light_decision_trades(
         decision: Decision, allow_new_24h_buys: bool | None = None, allow_new_crypto_buys: bool | None = None,
     ) -> Decision:
         """Hard-limit light decisions to 24h risk management.
 
-        Without an existing 24h position, light decisions should not open new
-        24h exposure; they are low-frequency checks, not a separate alpha engine.
+        Light decisions should not open or increase exposure; they are low-frequency
+        24h risk checks, not a separate alpha engine.
         """
         if allow_new_24h_buys is None:
             allow_new_24h_buys = bool(allow_new_crypto_buys)
@@ -1182,7 +1260,7 @@ class ExperimentRunner:
         if removed_scope:
             filters.append(f"filtered {removed_scope} out-of-scope trade(s) for light_decision")
         if removed_new_buy:
-            filters.append(f"filtered {removed_new_buy} new crypto BUY(s) / 24h-asset BUY(s) without existing 24h position")
+            filters.append(f"filtered {removed_new_buy} 24h-asset BUY(s) in light_decision watch mode")
         reason = f"{decision.reason} | {'; '.join(filters)}"
 
         if not allowed_trades:

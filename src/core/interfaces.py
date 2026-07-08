@@ -268,7 +268,7 @@ class IExperimentLogger(ABC):
     """Logs experiment data."""
 
     @abstractmethod
-    def log_decision(self, timestamp: str, decision: Decision, snapshot: PortfolioSnapshot) -> None:
+    def log_decision(self, timestamp: str, decision: Decision, snapshot: PortfolioSnapshot, decision_type: str = "full_decision") -> None:
         ...
 
     @abstractmethod

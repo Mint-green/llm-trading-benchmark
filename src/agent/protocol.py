@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 
+from src.core.futures_specs import get_futures_product_spec, is_futures_family_symbol
 from src.core.types import (
     Market, OrderSide, TradeOrder, Decision,
     PortfolioTarget, PlanAction, PlanTrigger, TriggerType,
@@ -140,14 +141,17 @@ class DecisionProtocol:
             if not symbol:
                 continue
 
-            market = self._ticker_to_market(symbol)
+            asset_type = t.get("asset_type", "equity")
+            market = Market.FUTURES if asset_type == "futures" else self._ticker_to_market(symbol)
             if market is None:
                 continue
-
-            asset_type = t.get("asset_type", "equity")
             reason = t.get("reason", "")
 
             if market == Market.FUTURES or asset_type == "futures":
+                if not is_futures_family_symbol(symbol):
+                    product = get_futures_product_spec(symbol)
+                    if product is not None:
+                        symbol = product.family_symbol
                 fut_side = (t.get("side") or "long").lower()
                 target_notional = t.get("target_notional_pct_nav")
                 action = t.get("action", "")

@@ -1,7 +1,9 @@
 from pathlib import Path
+import sqlite3
 from src.agent.context import ContextBuilder
 from src.agent.runner import AgentRunner
 from src.platform.experiment import ExperimentRunner
+from src.platform.logging import ExperimentLogger
 from src.platform.scheduler import DecisionScheduler
 from src.portfolio.constraints import ConstraintEngine
 from src.portfolio.portfolio import PortfolioEngine
@@ -64,6 +66,21 @@ class _CapturingRunner(AgentRunner):
         return '{"action":"hold","reason":"history retained"}', 0, 0, ""
 
 
+class _LightOneRoundRunner(_CapturingRunner):
+    def __init__(self):
+        super().__init__()
+        self._config = Config(max_agent_rounds=4)
+        self.final_call_count = 0
+
+    def _call_llm_with_tools(self, messages):
+        raise AssertionError("light_decision should not use tool rounds")
+
+    def _call_llm(self, messages):
+        self.final_call_count += 1
+        self.final_messages = messages
+        return '{"action":"hold","reason":"light one round"}', 0, 0, ""
+
+
 def test_market_timing_marks_last_chance_and_tail_guard():
     at_2030 = ContextBuilder._format_market_timing("2026-01-06 20:30", ["US", "CRYPTO"])
     assert "US|open|30|15|last_chance_buy_now_or_skip" in at_2030
@@ -71,6 +88,65 @@ def test_market_timing_marks_last_chance_and_tail_guard():
     at_2045 = ContextBuilder._format_market_timing("2026-01-06 20:45", ["US", "CRYPTO"])
     assert "US|open|15|0|tail_guard_active_no_new_buys" in at_2045
 
+
+def test_effective_round_budget_by_decision_type():
+    runner = object.__new__(AgentRunner)
+    runner._config = Config(max_agent_rounds=4)
+
+    assert runner._effective_max_rounds("full_decision") == 3
+    assert runner._effective_max_rounds("light_decision") == 1
+    assert runner._effective_max_rounds("focused_position") == 4
+
+
+def test_light_decision_uses_single_final_round_without_tools():
+    runner = _LightOneRoundRunner()
+    decision, rounds = runner.run(
+        timestamp="2026-01-06 04:00",
+        snapshot=object(),
+        market_data="",
+        stock_data="",
+        alerts="",
+        news="",
+        pre_built_messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "[DECISION_CONTEXT]\ndecision_type: light_decision"},
+        ],
+    )
+
+    assert decision.action == "hold"
+    assert decision.reason == "light one round"
+    assert len(rounds) == 1
+    assert runner.final_call_count == 1
+
+
+def test_log_decision_persists_decision_type():
+    db_path = Path("tmp_runs/test_artifacts/decision_type_unit.db")
+    logger = ExperimentLogger(str(db_path))
+    logger.init_run({}, model="unit", start_date="2026-01-06", end_date="2026-01-06")
+    snapshot = PortfolioSnapshot(
+        timestamp="2026-01-06 04:00",
+        cash=100000.0,
+        positions={},
+        total_nav=100000.0,
+        market_exposure={},
+        fx_rates={"USD": 1.0},
+    )
+
+    logger.log_decision(
+        "2026-01-06 04:00",
+        Decision(action="hold", reason="watch 24h assets"),
+        snapshot,
+        "light_decision",
+    )
+    logger.close()
+
+    con = sqlite3.connect(db_path)
+    try:
+        row = con.execute("SELECT decision_type FROM decisions ORDER BY id DESC LIMIT 1").fetchone()
+    finally:
+        con.close()
+
+    assert row == ("light_decision",)
 
 def test_agent_runner_retains_all_tool_results_for_final_round():
     runner = _CapturingRunner()
@@ -143,6 +219,7 @@ def test_light_decision_context_marks_24h_scope():
     assert "decision_type: light_decision" in context
     assert "scope: 24h_assets_only" in context
     assert "allowed_trade_markets: ['CRYPTO', 'GOLD', 'FUTURES']" in context
+    assert "do not open or increase 24h exposure" in context
 
 
 def test_market_overview_denied_for_full_and_light_decisions():
@@ -253,6 +330,17 @@ def test_auto_stop_loss_sell_skips_cooling_rejection():
     assert not runner._is_auto_sell_cooling_blocked("US:MSTR.US", 24, snapshot, "2026-01-09 19:00")
 
 
+def test_clustered_stop_losses_extend_market_buy_pause():
+    runner = object.__new__(ExperimentRunner)
+    runner._stop_loss_buy_pause_until = {}
+    runner._stop_loss_recent_by_market = {}
+
+    runner._record_stop_loss_buy_pause(Market.US, "2026-02-09 14:30")
+    assert runner._stop_loss_buy_pause_until[Market.US] == "2026-02-09 15:30"
+
+    runner._record_stop_loss_buy_pause(Market.US, "2026-02-09 14:40")
+    assert runner._stop_loss_buy_pause_until[Market.US] == "2026-02-09 17:40"
+
 def test_post_stop_loss_market_cooldown_filters_same_market_buys():
     runner = object.__new__(ExperimentRunner)
     runner._stop_loss_buy_pause_until = {Market.HK: "2026-01-07 02:30"}
@@ -286,7 +374,7 @@ def test_light_decision_blocks_new_crypto_buy_without_existing_position():
 
     assert filtered.action == "hold"
     assert filtered.trades == []
-    assert "new crypto BUY" in filtered.reason
+    assert "24h-asset BUY" in filtered.reason
 
 
 def test_light_decision_allows_crypto_sell_and_existing_position_buy():
@@ -468,6 +556,36 @@ def test_daily_rollover_summary_skips_backtest_start_day():
     assert not runner._should_generate_daily_rollover_summary("2026-01-07 00:05", [])
 
 
+def test_constraint_blocked_buy_is_filtered_before_execution():
+    runner = object.__new__(AgentRunner)
+    constraints = ConstraintEngine(Config())
+    constraints.set_tail_guard(True, [Market.CN.value])
+    runner._portfolio = type("PortfolioRef", (), {"_constraints": constraints})()
+    runner._price_lookup = lambda symbol, market, timestamp: 10.0
+    snapshot = PortfolioSnapshot(
+        timestamp="2026-01-06 06:45",
+        cash=100000.0,
+        positions={},
+        total_nav=100000.0,
+        market_exposure={},
+        fx_rates={"USD": 1.0},
+    )
+    decision = Decision(
+        action="trade",
+        trades=[TradeOrder("sh.601857", Market.CN, OrderSide.BUY, quantity=100)],
+        reason="tail buy",
+        memory_updates={"daily_thesis": "wait"},
+        plan_updates=[{"symbol": "sh.601857", "plan_action": "watch"}],
+    )
+
+    resolved = runner._finalize_trade_decision(decision, snapshot, "2026-01-06 06:45")
+
+    assert resolved.action == "hold"
+    assert "constraint-blocked BUY" in resolved.reason
+    assert "tail_guard" in resolved.reason
+    assert resolved.memory_updates == {"daily_thesis": "wait"}
+    assert resolved.plan_updates == [{"symbol": "sh.601857", "plan_action": "watch"}]
+
 def test_trade_decision_preserves_memory_and_plan_updates_after_filters():
     runner = object.__new__(AgentRunner)
     runner._portfolio = None
@@ -603,3 +721,51 @@ def test_daily_buy_limit_does_not_block_sell_orders():
 def test_model_configs_keep_five_minute_scanner_interval():
     assert 'decision_interval = 5' in Path('config/mimo.toml').read_text(encoding='utf-8')
     assert 'decision_interval = 5' in Path('config/deepseek.toml').read_text(encoding='utf-8')
+
+
+def test_non_retryable_trade_failures_skip_llm_retry():
+    feedback = [
+        {
+            "type": "failed",
+            "symbol": "GOLD_FUT",
+            "market": "FUTURES",
+            "side": "buy",
+            "quantity": 1,
+            "error": "target_notional_too_small_for_one_contract:min_valid_target_notional_pct_nav=0.0705",
+        }
+    ]
+
+    assert ExperimentRunner._should_retry_trade_failures(feedback) is False
+
+
+def test_repairable_trade_failures_still_retry_llm():
+    feedback = [
+        {
+            "type": "failed",
+            "symbol": "AAPL.US",
+            "market": "US",
+            "side": "buy",
+            "quantity": 10,
+            "error": "price unavailable",
+        }
+    ]
+
+    assert ExperimentRunner._should_retry_trade_failures(feedback) is True
+
+
+def test_non_retryable_trade_feedback_is_appended_to_reason():
+    decision = Decision(
+        action="trade",
+        reason="probe futures",
+        trades=[TradeOrder("GOLD_FUT", Market.FUTURES, OrderSide.BUY, allocation_pct=0.04, asset_type="futures")],
+    )
+
+    updated = ExperimentRunner._append_trade_feedback_to_reason(
+        decision,
+        "FAILED GOLD_FUT: target_notional_too_small_for_one_contract",
+    )
+
+    assert updated.action == "trade"
+    assert updated.trades == decision.trades
+    assert "execution feedback" in updated.reason
+    assert "target_notional_too_small" in updated.reason

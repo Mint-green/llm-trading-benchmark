@@ -382,16 +382,16 @@ class ExperimentLogger(IExperimentLogger):
         if column not in cols:
             self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
-    def log_decision(self, timestamp: str, decision: Decision, snapshot: PortfolioSnapshot) -> None:
+    def log_decision(self, timestamp: str, decision: Decision, snapshot: PortfolioSnapshot, decision_type: str = "full_decision") -> None:
         trades_json = json.dumps([
             {"symbol": t.symbol, "market": t.market.value, "side": t.side.value,
              "quantity": t.quantity, "reason": t.reason}
             for t in decision.trades
         ])
         self._conn.execute(
-            "INSERT INTO decisions (run_id, timestamp, action, trades, reason, portfolio_nav) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (self._run_id, timestamp, decision.action, trades_json,
+            "INSERT INTO decisions (run_id, timestamp, decision_type, action, trades, reason, portfolio_nav) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (self._run_id, timestamp, decision_type, decision.action, trades_json,
              decision.reason, snapshot.total_nav),
         )
         self._conn.commit()

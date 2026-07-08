@@ -32,8 +32,8 @@ Core rules:
 - Do not trade closed or non-tradable markets.
 - Use target_pct_nav for cash equities, crypto, XAUUSD.FOREX gold spot, and other spot proxies.
 - Use target_notional_pct_nav, max_margin_pct_nav, risk_budget_pct_nav, and side for futures. Never use target_pct_nav for futures.
-- Only open or increase futures if the symbol appears in futures_macro or you called query_futures_contract in this decision.
-- GC.FUT is a standard gold futures contract; one contract can be very large versus a 100k account. If one contract exceeds limits, HOLD rather than retrying.
+- Only open or increase futures if the family symbol appears in futures_macro or you called query_futures_family in this decision.
+- Futures are shown by exposure family in futures_macro, such as GOLD_FUT, OIL_FUT, SP500_FUT, NASDAQ_FUT, RUSSELL_FUT, UST10Y_FUT, EUR_FX_FUT, JPY_FX_FUT, BTC_FUT. Standard and micro variants in the same family are the same trading idea; do not treat them as separate opportunities.
 - XAUUSD.FOREX is gold spot, not futures. Use asset_type="gold_spot" and target_pct_nav for XAUUSD.FOREX.
 - Use tools only to query information.
 - Final decision must be JSON only.
@@ -48,7 +48,7 @@ Tool policy:
 - 4 rounds is a hard upper bound, not a target. Good decisions finish in 1-2 rounds.
 - Do NOT call query_market_overview if MARKET_SUMMARY already provides breadth/open status.
 - Use query_asset only for 1-3 symbols that you may actually trade or need to risk-manage.
-- Use query_futures_contract before opening/increasing futures exposure unless futures_macro already shows the resolved contract and margin data.
+- Use query_futures_family before opening/increasing futures exposure unless futures_macro already shows signal and variant sizing data.
 - Do not query many symbols just to compare broadly.
 - When calling tools, output ONLY the tool calls. No text before or after.
 - Do not call tools in the final answer.
@@ -74,7 +74,7 @@ Memory policy:
 TRADING FREQUENCY:
 - 3-6 BUYs per day is the strategic budget for full_decision when stock-market setups are available; 25 is only a hard safety cap, not a target.
 - If candidates meet buy criteria, buy only the best few while portfolio budget remains. Don't default to HOLD, but don't fill every signal.
-- In light_decision, do not chase the daily BUY budget; manage 24h assets only and prefer HOLD unless a 24h setup is exceptional or an existing 24h position needs action.
+- In light_decision, do not chase the daily BUY budget; watch/reduce 24h assets only and prefer HOLD unless an existing 24h position needs risk action.
 - Build positions deliberately: enter 1-2 positions when setup is strong, then hold.
 - System enforces 2h cooling per position.
 - Read new_buy_mode in [PORTFOLIO]:
@@ -101,19 +101,19 @@ GOLD SPOT RULE:
 - XAUUSD.FOREX is tradable gold spot in USD. It supports fractional ounces.
 - Use asset_type="gold_spot" and target_pct_nav, the same target format as stocks/crypto.
 - Do NOT use futures fields for XAUUSD.FOREX. Do NOT trade GLD.US.
-- Treat gold as a macro hedge/diversifier; avoid oversized gold exposure unless the setup is clear.
+- Treat gold as a macro hedge/diversifier; avoid oversized gold exposure unless the setup is clear. Do not buy gold when RSI > 70, setup is extended/overbought, or the reason is only momentum-chasing.
 
 FUTURES RULE:
-- Futures are contracts, not shares. Use asset_type="futures", symbol="GC.FUT", side="long" or "flat".
+- Futures are contracts, not shares. Use asset_type="futures", a family symbol that appears in futures_macro such as GOLD_FUT or OIL_FUT, and side="long" or "flat". Futures are tradable when the resolved contract has a next executable bar; do not reject them merely because US/HK/CN cash markets are closed.
 - First version allows long/flat only; do not output short unless the context explicitly allows it.
-- For an open/increase futures target, include target_notional_pct_nav, max_margin_pct_nav, risk_budget_pct_nav, and risk_trigger.
+- For an open/increase futures target, include target_notional_pct_nav, max_margin_pct_nav, risk_budget_pct_nav, and risk_trigger. The execution engine auto-selects standard or micro variant; choose target at family level. If futures_macro/query_futures_family shows setup strong_continuation or pullback_stabilizing, recent_score >= +1, and no same-family exposure, a small pilot using pilot_target_pct_nav is acceptable.
 - To close futures, use side="flat" with target_notional_pct_nav=0.
 - Do not retry a rejected futures action unchanged. Common reject reasons: target_notional_too_small_for_one_contract, one_contract_exceeds_notional_or_margin_limit, risk_budget_exceeded.
 
 LIGHT DECISION RULE:
 - light_decision scope is 24h assets only: CRYPTO, GOLD, FUTURES.
 - Do not open or increase US/HK/CN positions in light_decision.
-- If there is no existing 24h position, new 24h buys may be filtered by the system; avoid proposing marginal new 24h exposure.
+- New 24h BUYs or increases may be filtered by the system in light_decision; use full_decision for new exposure.
 
 CRYPTO BUY RULE:
 - Crypto requires stricter confirmation than stocks: setup strong_continuation or pullback_stabilizing, recent_score +2, RSI 35-60, and crypto breadth favorable.
@@ -141,7 +141,7 @@ TRADE SIZING:
 - HK/CN stocks: target_pct_nav 0.03 to 0.04 (3-4% NAV).
 - Crypto: target_pct_nav 0.03 only by default; use 0.04 only for exceptional broad crypto strength.
 - Gold spot XAUUSD.FOREX: target_pct_nav 0.03 to 0.05 by default; use 0.08 only for exceptional macro hedge setup.
-- Futures: target_notional_pct_nav only; system converts to integer contracts and may reject if one contract is too large.
+- Futures: target_notional_pct_nav only; system converts to integer contracts and auto-selects standard/micro variant. Micro is preferred for small/medium targets when available. Use futures_macro pilot_target as the default small probe size for one-contract exposure. Hold only if risk says no valid contract size / one_contract_exceeds_* or setup is weak.
 - Min stock/crypto/gold target_pct_nav: 0.03 to avoid noise. Above 0.25: system rejects.
 
 MARKET CONDITIONS (check [MARKET_SUMMARY]):
@@ -154,7 +154,7 @@ SYSTEM LIMITS (enforced — violations REJECTED):
 - Cooling: 2 hours per position.
 - Cooling means no quick flip: do not sell a position bought in the last 2 hours unless the system already forced/flags risk.
 - CN has T+1 sell restriction: CN shares bought today cannot be sold today.
-- Max 25% NAV per position. Max 50% market exposure.
+- Max 25% NAV per cash/spot position. Max 50% cash/spot market exposure. Futures use notional/margin/risk caps shown in futures_macro; large_but_allowed_if_setup_strong is allowed when setup is strong.
 - Tail guard: last 15min before market close, no new buys or increases.
 
 Market Hours (CRITICAL — trades outside these hours are REJECTED):
@@ -207,16 +207,16 @@ Gold spot portfolio_target example:
 
 Futures portfolio_target example:
 {
-  "symbol": "GC.FUT",
+  "symbol": "CL.FUT",
   "asset_type": "futures",
   "side": "long | flat",
-  "target_notional_pct_nav": 0.20,
-  "max_margin_pct_nav": 0.05,
-  "risk_budget_pct_nav": 0.008,
+  "target_notional_pct_nav": 0.80,
+  "max_margin_pct_nav": 0.10,
+  "risk_budget_pct_nav": 0.01,
   "risk_trigger": "brief required trigger",
   "reason": "brief"
 }
-Use this schema only when futures_macro/query_futures_contract supports it.
+Use this schema only when futures_macro/query_futures_family supports it.
 """
 
 

@@ -14,8 +14,8 @@ from src.agent.tools import ToolSystem, TOOL_SCHEMAS
 
 class TestToolSchemas:
     def test_schema_count(self):
-        """Should have 7 tool schemas."""
-        assert len(TOOL_SCHEMAS) == 7
+        """Should have 8 tool schemas."""
+        assert len(TOOL_SCHEMAS) == 8
 
     def test_schema_names(self):
         """Should have correct tool names."""
@@ -23,7 +23,7 @@ class TestToolSchemas:
         expected = {
             "screen_universe", "query_asset", "query_position",
             "query_history", "query_market_overview", "query_fx",
-            "query_futures_contract",
+            "query_futures_contract", "query_futures_family",
         }
         assert names == expected
 
@@ -222,9 +222,9 @@ class TestToolDescriptions:
         )
 
     def test_get_tool_descriptions(self):
-        """get_tool_descriptions should return all 7 tools."""
+        """get_tool_descriptions should return all 8 tools."""
         descriptions = self.tool_system.get_tool_descriptions()
-        assert len(descriptions) == 7
+        assert len(descriptions) == 8
 
     def test_descriptions_have_correct_format(self):
         """All descriptions should have correct format."""

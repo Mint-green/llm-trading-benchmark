@@ -487,7 +487,7 @@ HK: Currency=HKD; Settlement=T+0; Variable lots; Lot rounding auto; No price lim
 CN: Currency=CNY; Buy=T+0; Sell=T+1; Lot=100; Price limit ±10% (STAR ±20%); Halted/limit-locked non-tradable.
 Crypto: Currency=USD; 24/7; Fractional ok; Max exposure=25% NAV.
 Gold: Currency=USD; spot XAUUSD.FOREX only; fractional ounces; use target_pct_nav, not futures fields; max 25% NAV.
-Futures: Currency=USD; contracts only; use target_notional_pct_nav, max_margin_pct_nav, risk_budget_pct_nav; query_futures_contract before opening/increasing.
+Futures: Currency=USD; decide at futures family level shown in futures_macro (e.g. GOLD_FUT), not separate standard/micro ideas; use target_notional_pct_nav, max_margin_pct_nav, risk_budget_pct_nav; execution auto-selects standard or micro variant; pilot_target is a one-contract micro/lowest-valid starting point, not a required trade; futures tradability follows contract data/next executable bar, not US/HK/CN cash-market hours; one_contract_exceeds_* is a hard block; query_futures_family/query_futures_contract before opening if context lacks data.
 Global: Multi-currency accounts; Auto FX if balance insufficient; Local currency consumed first; Violations reject orders.
 
 [TRADING_COSTS] All prices include costs and slippage.
@@ -808,7 +808,7 @@ Avoid trades where expected edge < transaction costs."""
 
         # futures_macro
         fmt_bucket("futures_macro", buckets.futures_macro,
-                   "symbol|actual_contract|price|trend|1h|1d|atr_pct|notional_per_contract|initial_margin|maintenance_margin|one_contract_notional_pct_nav|one_contract_margin_pct_nav|roll_status|days_to_expiry|risk")
+                   "family|signal|price|trend|1h|1d|rsi|setup|recent|atr_pct|pilot_target|roll|std_variant|micro_variant|guidance|risk")
 
         # blocked_or_warning
         fmt_bucket("blocked_or_warning", buckets.blocked_or_warning,
@@ -868,6 +868,13 @@ Avoid trades where expected edge < transaction costs."""
                     f"{c.chg_1d:+.1f}|{c.rsi:.0f}|{trend_vars}|{risk}")
 
         if bucket_name == "futures_macro":
+            if c.asset_type == "futures_family":
+                roll = f"{c.roll_status},{c.days_to_expiry}d"
+                pilot = f"{c.pilot_target_pct_nav:.0%}" if c.pilot_target_pct_nav else "n/a"
+                return (f"{c.ticker}|{c.signal_symbol}:{c.actual_contract}|{c.price:.2f}|{c.trend}|"
+                        f"{c.chg_1h:+.2f}|{c.chg_1d:+.2f}|{c.rsi:.0f}|{c.setup}|{c.recent_score:+d}|"
+                        f"{c.atr_pct:.2f}|{pilot}|{roll}|{c.standard_variant}|{c.micro_variant}|{c.execution_guidance}|"
+                        f"{c.risk_note or c.liquidity_note}")
             return (f"{c.ticker}|{c.actual_contract}|{c.price:.2f}|{c.trend}|"
                     f"{c.chg_1h:+.2f}|{c.chg_1d:+.2f}|{c.atr_pct:.2f}|"
                     f"{c.notional_per_contract:.0f}|{c.initial_margin:.0f}|{c.maintenance_margin:.0f}|"
@@ -947,5 +954,5 @@ Avoid trades where expected edge < transaction costs."""
         if decision_type == "light_decision":
             lines.append("scope: 24h_assets_only")
             lines.append("allowed_trade_markets: ['CRYPTO', 'GOLD', 'FUTURES']")
-            lines.append("light_decision_rule: risk-manage existing 24h positions; open new 24h exposure only if already allowed by system state and setup is exceptional")
+            lines.append("light_decision_rule: watch/reduce existing 24h positions only; do not open or increase 24h exposure")
         return "\n".join(lines)

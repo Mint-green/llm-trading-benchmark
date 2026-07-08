@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, date
 
 from src.core.config import Config
+from src.core.futures_specs import get_futures_product_spec, futures_symbol_allowed
 from src.core.types import FuturesContractSpec, FuturesResolvedContract
 from src.data.provider import MarketDataProvider
 
@@ -25,8 +26,11 @@ class FuturesContractResolver:
     def resolve(self, continuous_symbol: str, timestamp: str) -> FuturesResolvedContract:
         if not self._config.futures.enabled:
             return self._empty(continuous_symbol, timestamp, "expired_or_invalid", "futures_disabled")
-        if continuous_symbol not in self._config.futures.allowed_symbols:
+        if not futures_symbol_allowed(continuous_symbol, self._config.futures.allowed_symbols):
             return self._empty(continuous_symbol, timestamp, "expired_or_invalid", "symbol_not_allowed")
+
+        if get_futures_product_spec(continuous_symbol) is None:
+            return self._empty(continuous_symbol, timestamp, "expired_or_invalid", "unsupported_contract_spec")
 
         specs = self._load_specs(continuous_symbol)
         ts_date = self._parse_date(timestamp)
@@ -95,28 +99,19 @@ class FuturesContractResolver:
 
     def _build_spec(self, row: dict) -> FuturesContractSpec:
         root = row["root_symbol"]
-        if root == "GC":
-            multiplier = self._config.futures.gc_multiplier
-            tick_size = self._config.futures.gc_tick_size
-            tick_value = self._config.futures.gc_tick_value
-            initial_margin = self._config.futures.gc_initial_margin
-            maintenance_margin = self._config.futures.gc_maintenance_margin
-        else:
-            multiplier = 1.0
-            tick_size = 0.01
-            tick_value = 0.01
-            initial_margin = 0.0
-            maintenance_margin = 0.0
+        product = get_futures_product_spec(root)
+        if product is None:
+            raise ValueError(f"Unsupported futures root: {root}")
         return FuturesContractSpec(
             root_symbol=root,
             continuous_symbol=row["continuous_symbol"],
             contract_ticker=row["contract_ticker"],
             exchange=row.get("exchange", ""),
-            multiplier=multiplier,
-            tick_size=tick_size,
-            tick_value=tick_value,
-            initial_margin=initial_margin,
-            maintenance_margin=maintenance_margin,
+            multiplier=product.multiplier,
+            tick_size=product.tick_size,
+            tick_value=product.tick_value,
+            initial_margin=product.initial_margin,
+            maintenance_margin=product.maintenance_margin,
             expiry_date=row.get("expiry_date"),
             status=row.get("status"),
             bars_count=row.get("bars_count"),

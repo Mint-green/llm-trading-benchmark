@@ -11,6 +11,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from .types import Market, MarketHours, PositionLimit
+from src.core.futures_specs import DEFAULT_ALLOWED_FUTURES_SYMBOLS
 
 
 @dataclass(frozen=True)
@@ -85,12 +86,12 @@ class GoldConfig:
 
 @dataclass(frozen=True)
 class FuturesConfig:
-    """Conservative futures configuration for the first GC.FUT implementation."""
+    """Conservative futures configuration for the supported futures basket."""
     enabled: bool = True
-    allowed_symbols: tuple[str, ...] = ("GC.FUT",)
+    allowed_symbols: tuple[str, ...] = DEFAULT_ALLOWED_FUTURES_SYMBOLS
     allow_short: bool = False
     max_contracts_per_symbol: int = 1
-    max_abs_notional_pct_nav: float = 0.50
+    max_abs_notional_pct_nav: float = 1.00
     max_total_abs_notional_pct_nav: float = 1.00
     max_margin_pct_nav: float = 0.10
     max_total_margin_pct_nav: float = 0.20
@@ -168,7 +169,8 @@ class Config:
     dataset_version: str = "2026-06-05"
 
     # --- Agent ---
-    max_agent_rounds: int = 4  # Round1=context, 2-3=tools, 4=mandatory decision
+    max_agent_rounds: int = 4  # Global hard cap; v3 decision types may use lower caps
+    full_decision_max_rounds: int = 3
     max_decisions: int = 0     # 0 = unlimited
 
     # --- Decision Schedule ---
@@ -265,7 +267,7 @@ class Config:
             Market.CN: 50,
             Market.CRYPTO: 18,
             Market.GOLD: 1,
-            Market.FUTURES: 1,
+            Market.FUTURES: 9,
         }
     )
 
@@ -294,6 +296,8 @@ class Config:
         schedule_cfg = data.get("decision_schedule", {})
         open_window_cfg = schedule_cfg.get("open_window", {})
         close_window_cfg = schedule_cfg.get("close_window", {})
+        futures_section_present = "futures" in data
+        gold_section_present = "gold" in data
         futures_cfg = data.get("futures", {})
         gold_cfg = data.get("gold", {})
 
@@ -344,19 +348,20 @@ class Config:
             },
             # Agent
             "max_agent_rounds": agent_cfg.get("max_rounds", 4),
+            "full_decision_max_rounds": agent_cfg.get("full_decision_max_rounds", 3),
             # Decision schedule
             "gold": GoldConfig(
-                enabled=gold_cfg.get("enabled", True),
+                enabled=gold_cfg.get("enabled", gold_section_present),
                 allowed_symbols=tuple(gold_cfg.get("allowed_symbols", ["XAUUSD.FOREX"])),
                 ask_symbol=gold_cfg.get("ask_symbol", "XAUUSD.FOREX.ASK"),
                 max_exposure_pct_nav=gold_cfg.get("max_exposure_pct_nav", 0.25),
             ),
             "futures": FuturesConfig(
-                enabled=futures_cfg.get("enabled", True),
-                allowed_symbols=tuple(futures_cfg.get("allowed_symbols", ["GC.FUT"])),
+                enabled=futures_cfg.get("enabled", futures_section_present),
+                allowed_symbols=tuple(futures_cfg.get("allowed_symbols", list(DEFAULT_ALLOWED_FUTURES_SYMBOLS))),
                 allow_short=futures_cfg.get("allow_short", False),
                 max_contracts_per_symbol=futures_cfg.get("max_contracts_per_symbol", 1),
-                max_abs_notional_pct_nav=futures_cfg.get("max_abs_notional_pct_nav", 0.50),
+                max_abs_notional_pct_nav=futures_cfg.get("max_abs_notional_pct_nav", 1.00),
                 max_total_abs_notional_pct_nav=futures_cfg.get("max_total_abs_notional_pct_nav", 1.00),
                 max_margin_pct_nav=futures_cfg.get("max_margin_pct_nav", 0.10),
                 max_total_margin_pct_nav=futures_cfg.get("max_total_margin_pct_nav", 0.20),
@@ -414,6 +419,7 @@ class Config:
             "decision_interval": self.decision_interval,
             "initial_cash": self.initial_cash,
             "max_agent_rounds": self.max_agent_rounds,
+            "full_decision_max_rounds": self.full_decision_max_rounds,
             "temperature": self.temperature,
             "thinking_enabled": self.thinking_enabled,
             "decision_schedule": {
