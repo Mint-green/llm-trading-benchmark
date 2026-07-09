@@ -1,0 +1,93 @@
+# 复制为 config.toml，填入你的值
+# config.toml 被 .gitignore 排除
+
+[data]
+# 数据源项目地址
+base_dir = ""
+
+[backtest]
+start = "2026-02-03"
+end = "2026-02-09"
+decision_interval = 5   # 分钟
+max_decisions = 0       # 0=不限制
+
+[model]
+# 模型原名：mimo-v2.5-pro / deepseek-v4-pro
+name = "mimo-v2.5-pro"
+temperature = 0.3
+thinking_enabled = false  # 关闭 thinking 可大幅降低延迟和 token 消耗
+max_tokens = 4096
+timeout = 180
+
+[model.api]
+# 填入你的 API key
+mimo_v2_5_pro_api_key = ""
+mimo_v2_5_pro_base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+deepseek_v4_pro_api_key = ""
+deepseek_v4_pro_base_url = "https://api.deepseek.com"
+
+[portfolio]
+initial_cash = 100000
+
+[portfolio.position_limits]
+max_single = 0.25
+max_market = 0.50
+max_crypto = 0.25
+min_cash = 0.05
+
+[costs]
+cn_sell_tax_bps = 5
+fx_fee_bps = 5
+
+[costs.commission_bps]
+US = 3
+HK = 5
+CN = 3
+CRYPTO = 10
+GOLD = 0
+
+[costs.slippage_bps]
+US = 5
+HK = 5
+CN = 5
+CRYPTO = 10
+GOLD = 5
+
+[gold]
+enabled = true
+allowed_symbols = ["XAUUSD.FOREX"]
+ask_symbol = "XAUUSD.FOREX.ASK"
+max_exposure_pct_nav = 0.25
+
+[futures]
+enabled = true
+allowed_symbols = ["GOLD_FUT", "OIL_FUT", "SP500_FUT", "NASDAQ_FUT", "RUSSELL_FUT", "UST10Y_FUT", "EUR_FX_FUT", "JPY_FX_FUT", "BTC_FUT"]
+allow_short = false
+max_contracts_per_symbol = 1
+max_abs_notional_pct_nav = 1.00
+max_margin_pct_nav = 0.10
+max_risk_budget_pct_nav = 0.01
+roll_days_before_expiry = 5
+commission_per_contract = 2.50  # fixed dollars per contract; not bps
+slippage_bps = 2                # execution slippage only; generic costs.slippage_bps is not used for futures
+
+[agent]
+max_rounds = 8
+full_decision_max_rounds = 3
+
+
+# Full LLM decision cadence. --interval controls the local timestamp/scanner grid.
+[decision_schedule]
+normal_interval_minutes = 30
+
+[decision_schedule.open_window]
+enabled = true
+minutes_after_open = 30
+interval_minutes = 15
+include_open_plus_30 = true
+
+[decision_schedule.close_window]
+enabled = true
+minutes_before_close = 30
+interval_minutes = 15
+include_close_time = false

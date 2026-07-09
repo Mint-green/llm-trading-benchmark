@@ -1,0 +1,23 @@
+# 用户配置（含 API key）
+config/*.toml
+!config/template.toml
+
+# 数据库文件
+*.db
+output/
+
+# 本地备份
+bak/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# 系统
+.DS_Store
+Thumbs.db
