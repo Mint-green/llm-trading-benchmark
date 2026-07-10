@@ -84,7 +84,7 @@ class FuturesAccount:
             )
             marks.append(mark)
             self.mark_history.append(mark)
-            self._roll_if_needed(pos, timestamp)
+            self._roll_if_needed(key, pos, timestamp)
         self.margin_state = self._compute_margin_state()
         if self.margin_state == "BREACH":
             self.force_liquidate(timestamp)
@@ -93,13 +93,14 @@ class FuturesAccount:
     def force_liquidate(self, timestamp: str) -> list[TradeResult]:
         results: list[TradeResult] = []
         ranked = sorted(
-            self.positions.values(),
-            key=lambda p: (p.margin_locked, -p.cumulative_variation_pnl, p.notional),
+            self.positions.items(),
+            key=lambda item: (item[1].margin_locked, -item[1].cumulative_variation_pnl, item[1].notional),
             reverse=True,
         )
-        for pos in ranked:
+        for key, pos in ranked:
+            family_symbol = key.split(":", 1)[1]
             order = TradeOrder(
-                symbol=pos.continuous_symbol,
+                symbol=family_symbol,
                 market=Market.FUTURES,
                 side=OrderSide.SELL,
                 quantity=pos.contracts,
@@ -116,7 +117,7 @@ class FuturesAccount:
         return results
 
 
-    def _roll_if_needed(self, pos: FuturesPosition, timestamp: str) -> None:
+    def _roll_if_needed(self, key: str, pos: FuturesPosition, timestamp: str) -> None:
         """Roll a held contract when the point-in-time resolver has moved on.
 
         The old contract is already marked to timestamp before this method runs.
@@ -132,8 +133,9 @@ class FuturesAccount:
         old_notional = pos.notional
         old_cumulative_pnl = pos.cumulative_variation_pnl
 
+        family_symbol = key.split(":", 1)[1]
         close_order = TradeOrder(
-            symbol=pos.continuous_symbol,
+            symbol=family_symbol,
             market=Market.FUTURES,
             side=OrderSide.SELL,
             quantity=pos.contracts,
@@ -148,7 +150,7 @@ class FuturesAccount:
 
         target_pct = old_notional / self.nav if self.nav > 0 else 0.0
         open_order = TradeOrder(
-            symbol=pos.continuous_symbol,
+            symbol=family_symbol,
             market=Market.FUTURES,
             side=OrderSide.BUY,
             reason="roll into resolved futures contract",

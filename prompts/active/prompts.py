@@ -106,7 +106,7 @@ GOLD SPOT RULE:
 FUTURES RULE:
 - Futures are contracts, not shares. Use asset_type="futures", a family symbol that appears in futures_macro such as GOLD_FUT or OIL_FUT, and side="long" or "flat". Futures are tradable when the resolved contract has a next executable bar; do not reject them merely because US/HK/CN cash markets are closed.
 - First version allows long/flat only; do not output short unless the context explicitly allows it.
-- For an open/increase futures target, include target_notional_pct_nav, max_margin_pct_nav, risk_budget_pct_nav, and risk_trigger. The execution engine auto-selects standard or micro variant; choose target at family level. If futures_macro/query_futures_family shows setup strong_continuation or pullback_stabilizing, recent_score >= +1, and no same-family exposure, a small pilot using pilot_target_pct_nav is acceptable.
+- For an open/increase futures target, include target_notional_pct_nav, max_margin_pct_nav, risk_budget_pct_nav, and risk_trigger. The execution engine auto-selects standard or micro variant; choose target at family level. If futures_macro/query_futures_family shows setup strong_continuation or pullback_stabilizing, recent_score >= +1, no same-family exposure, and pilot_target is not n/a/0, a small pilot using exactly pilot_target_pct_nav is acceptable. Do not infer a smaller target from variant notional text.
 - To close futures, use side="flat" with target_notional_pct_nav=0.
 - Do not retry a rejected futures action unchanged. Common reject reasons: target_notional_too_small_for_one_contract, one_contract_exceeds_notional_or_margin_limit, risk_budget_exceeded.
 
@@ -141,7 +141,7 @@ TRADE SIZING:
 - HK/CN stocks: target_pct_nav 0.03 to 0.04 (3-4% NAV).
 - Crypto: target_pct_nav 0.03 only by default; use 0.04 only for exceptional broad crypto strength.
 - Gold spot XAUUSD.FOREX: target_pct_nav 0.03 to 0.05 by default; use 0.08 only for exceptional macro hedge setup.
-- Futures: target_notional_pct_nav only; system converts to integer contracts and auto-selects standard/micro variant. Micro is preferred for small/medium targets when available. Use futures_macro pilot_target as the default small probe size for one-contract exposure. Hold only if risk says no valid contract size / one_contract_exceeds_* or setup is weak.
+- Futures: target_notional_pct_nav only; system converts to integer contracts and auto-selects standard/micro variant. Micro is preferred for small/medium targets when available. Use futures_macro pilot_target as the default small probe size for one-contract exposure; if pilot_target is n/a, do not open a pilot. Hold only if risk says no valid contract size / one_contract_exceeds_* or setup is weak.
 - Min stock/crypto/gold target_pct_nav: 0.03 to avoid noise. Above 0.25: system rejects.
 
 MARKET CONDITIONS (check [MARKET_SUMMARY]):

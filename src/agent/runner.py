@@ -208,11 +208,13 @@ class AgentRunner(IAgentRunner):
         resolved_trades, buy_filter_reason = self._filter_constraint_blocked_buys(
             resolved_trades, snapshot,
         )
+        resolved_trades, futures_filter_reason = self._filter_existing_futures_buys(
+            resolved_trades, snapshot,
+        )
         reason = decision.reason
-        for extra_reason in (filter_reason, lot_filter_reason, buy_filter_reason):
+        for extra_reason in (filter_reason, lot_filter_reason, buy_filter_reason, futures_filter_reason):
             if extra_reason:
                 reason = f"{reason} | {extra_reason}".strip()
-
         if not resolved_trades:
             return Decision(
                 action="hold",
@@ -338,6 +340,32 @@ class AgentRunner(IAgentRunner):
         if not blocked:
             return trades, ""
         return filtered, f"filtered {len(blocked)} constraint-blocked BUY(s): {', '.join(blocked)}"
+
+    @staticmethod
+    def _filter_existing_futures_buys(
+        trades: list[TradeOrder], snapshot: PortfolioSnapshot,
+    ) -> tuple[list[TradeOrder], str]:
+        """Drop futures BUYs that would try to increase an existing family position."""
+        if not trades or not snapshot.futures_positions:
+            return trades, ""
+
+        filtered: list[TradeOrder] = []
+        blocked = []
+        for trade in trades:
+            is_futures_buy = (
+                trade.side == OrderSide.BUY
+                and (trade.market == Market.FUTURES or trade.asset_type == "futures")
+            )
+            key = f"FUTURES:{trade.symbol}"
+            if is_futures_buy and key in snapshot.futures_positions:
+                blocked.append(trade.symbol)
+                continue
+            filtered.append(trade)
+
+        if not blocked:
+            return trades, ""
+        return filtered, f"filtered {len(blocked)} existing-futures BUY(s): {', '.join(blocked)}"
+
     def _filter_zero_lot_buys(self, trades: list[TradeOrder]) -> tuple[list[TradeOrder], str]:
         """Drop BUY orders that execution lot rounding would reduce to zero."""
         if not trades or self._portfolio is None:

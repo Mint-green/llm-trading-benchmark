@@ -184,7 +184,9 @@ class FuturesCandidateBuilder:
         if not notionals:
             return 0.0
         raw = min(notionals) / nav * 1.05
-        return min(0.10, max(0.01, math.ceil(raw * 100) / 100))
+        if raw > 0.10:
+            return 0.0
+        return max(0.01, math.ceil(raw * 100) / 100)
 
     def _family_guidance(self, standard_symbol: str | None, micro_symbol: str | None, variants: list[tuple[str, FuturesResolvedContract, object, str]], nav: float) -> str:
         if not micro_symbol:

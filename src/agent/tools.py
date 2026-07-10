@@ -377,7 +377,9 @@ class ToolSystem(IToolSystem):
             return 0.0
         import math
         raw = min(notionals) / nav * 1.05
-        return min(0.10, max(0.01, math.ceil(raw * 100) / 100))
+        if raw > 0.10:
+            return 0.0
+        return max(0.01, math.ceil(raw * 100) / 100)
 
     def _query_futures_contract(self, args: dict, timestamp: str) -> str:
         """Query point-in-time actual contract mapping and futures risk metadata."""

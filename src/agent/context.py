@@ -487,7 +487,7 @@ HK: Currency=HKD; Settlement=T+0; Variable lots; Lot rounding auto; No price lim
 CN: Currency=CNY; Buy=T+0; Sell=T+1; Lot=100; Price limit ±10% (STAR ±20%); Halted/limit-locked non-tradable.
 Crypto: Currency=USD; 24/7; Fractional ok; Max exposure=25% NAV.
 Gold: Currency=USD; spot XAUUSD.FOREX only; fractional ounces; use target_pct_nav, not futures fields; max 25% NAV.
-Futures: Currency=USD; decide at futures family level shown in futures_macro (e.g. GOLD_FUT), not separate standard/micro ideas; use target_notional_pct_nav, max_margin_pct_nav, risk_budget_pct_nav; execution auto-selects standard or micro variant; pilot_target is a one-contract micro/lowest-valid starting point, not a required trade; futures tradability follows contract data/next executable bar, not US/HK/CN cash-market hours; one_contract_exceeds_* is a hard block; query_futures_family/query_futures_contract before opening if context lacks data.
+Futures: Currency=USD; decide at futures family level shown in futures_macro (e.g. GOLD_FUT), not separate standard/micro ideas; use target_notional_pct_nav, max_margin_pct_nav, risk_budget_pct_nav; execution auto-selects standard or micro variant; pilot_target is a one-contract micro/lowest-valid starting point; n/a means no small pilot is valid; futures tradability follows contract data/next executable bar, not US/HK/CN cash-market hours; one_contract_exceeds_* is a hard block; query_futures_family/query_futures_contract before opening if context lacks data.
 Global: Multi-currency accounts; Auto FX if balance insufficient; Local currency consumed first; Violations reject orders.
 
 [TRADING_COSTS] All prices include costs and slippage.
