@@ -53,12 +53,37 @@ python runners/run_backtest.py --config config/mimo.toml --start 2026-02-03 --en
 
 # DeepSeek 7天回测
 python runners/run_backtest.py --config config/deepseek.toml --start 2026-02-03 --end 2026-02-09
-
-# 中断恢复
-python runners/run_backtest.py --resume --output artifacts/runs/xxx.db
 ```
 
-### 4. 查看结果
+### 6. 中断恢复与续跑
+
+支持两种续跑模式：
+
+**`--resume`：从中断处继续**
+
+程序异常退出后，从最后一个 checkpoint 恢复，继续跑完剩余时间段。
+
+```bash
+python runners/run_backtest.py --config config/mimo.toml --output artifacts/runs/xxx.db --resume
+```
+
+**`--extend-end`：延长回测时间**
+
+回测完成后，延长结束日期继续跑。所有数据写入同一个数据库，checkpoint 自动衔接。
+
+```bash
+# 原来跑 1/5-1/9，延长到 1/15
+python runners/run_backtest.py --config config/mimo.toml --start 2026-01-05 --output artifacts/runs/xxx.db --extend-end 2026-01-15
+```
+
+注意事项：
+- `--resume` 要求代码版本一致（code_version 匹配）
+- `--extend-end` 允许代码版本不同（只延续 end_date）
+- 旧版本代码生成的 checkpoint 可以用新版本代码续跑（自动处理 enum 兼容）
+- 必须指定 `--output` 指向已有的数据库文件
+- `--start` 需要和原始运行一致
+
+### 7. 查看结果
 
 ```bash
 sqlite3 artifacts/runs/xxx.db "SELECT * FROM benchmark_runs;"
@@ -71,17 +96,19 @@ sqlite3 artifacts/runs/xxx.db "SELECT * FROM benchmark_runs;"
 ```
 python runners/run_backtest.py [OPTIONS]
 
---config PATH         配置文件路径（默认 config/config.toml）
---model TEXT          模型名称（覆盖配置文件）
---start TEXT          开始日期 (YYYY-MM-DD)
---end TEXT            结束日期 (YYYY-MM-DD)
---interval INT        决策间隔（分钟）
---initial-cash FLOAT  初始资金
---max-decisions INT   最大决策数（0=不限制）
---thinking            开启思考模式
---output PATH         输出数据库路径
---resume              从上次中断处继续
---extend-end TEXT     延长已有回测的结束日期
+--config PATH              配置文件路径（默认 config/config.toml）
+--model TEXT               模型名称（覆盖配置文件）
+--start TEXT               开始日期 (YYYY-MM-DD)
+--end TEXT                 结束日期 (YYYY-MM-DD)
+--interval INT             决策间隔（分钟）
+--initial-cash FLOAT       初始资金
+--max-decisions INT        最大决策数（0=不限制）
+--max-rounds INT           每决策最大 LLM 轮次
+--thinking                 开启思考模式
+--output PATH              输出数据库路径
+--resume                   从上次中断处继续（需代码版本一致）
+--extend-end TEXT          延长回测到新结束日期（允许代码版本不同）
+--fork-from-checkpoint DB  从另一个运行的 checkpoint 分叉
 ```
 
 ---

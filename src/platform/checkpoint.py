@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import inspect
+import typing
 import zlib
 from collections import defaultdict
 from dataclasses import fields, is_dataclass
@@ -89,7 +91,80 @@ def restore_runtime_state(runner: Any, state: dict[str, Any]) -> dict[str, Any]:
             setattr(component, field, value)
     runner.memory.__dict__.clear()
     runner.memory.__dict__.update(state["memory"])
+    _normalize_enums(runner)
     return state["loop"]
+
+
+def _normalize_enums(runner: Any) -> None:
+    """Convert string fields back to enums after checkpoint restore.
+
+    Old checkpoints may store enum values as plain strings inside dataclass fields.
+    Uses type hints to automatically detect and convert all enum fields.
+    """
+    import dataclasses
+    from src.core.types import (
+        Market, RiskMode, OrderSide, TriggerType, DecisionType,
+    )
+
+    def _fix_obj(obj: Any) -> None:
+        """Recursively fix enum fields on a dataclass or list of objects."""
+        if obj is None or isinstance(obj, (str, int, float, bool)):
+            return
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            hints = typing.get_type_hints(type(obj))
+            for field in dataclasses.fields(obj):
+                val = getattr(obj, field.name)
+                if val is None:
+                    continue
+                hint = hints.get(field.name)
+                # Direct enum field
+                if isinstance(hint, type) and issubclass(hint, Enum) and isinstance(val, str):
+                    try:
+                        setattr(obj, field.name, hint(val))
+                    except ValueError:
+                        pass
+                # Nested dataclass
+                elif dataclasses.is_dataclass(val):
+                    _fix_obj(val)
+                # List of objects
+                elif isinstance(val, list):
+                    for item in val:
+                        _fix_obj(item)
+                # Dict
+                elif isinstance(val, dict):
+                    for v in val.values():
+                        _fix_obj(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _fix_obj(item)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                _fix_obj(v)
+
+    # Fix portfolio positions
+    for pos in runner.portfolio._positions.values():
+        _fix_obj(pos)
+    # Fix portfolio trade history
+    for result in runner.portfolio._trade_history:
+        _fix_obj(result)
+    # Fix futures account
+    for result in runner.futures_account.trade_history:
+        _fix_obj(result)
+    # Fix memory plans (ActivePlan → PlanTrigger)
+    for plan in runner.memory._plans.values():
+        _fix_obj(plan)
+    # Fix risk mode on runner
+    if isinstance(runner._risk_mode, str):
+        try:
+            runner._risk_mode = RiskMode(runner._risk_mode)
+        except ValueError:
+            pass
+    # Fix market_exposure keys (dict keys can't be dataclass fields)
+    if hasattr(runner.portfolio, '_market_exposure') and isinstance(runner.portfolio._market_exposure, dict):
+        runner.portfolio._market_exposure = {
+            (Market(k) if isinstance(k, str) else k): v
+            for k, v in runner.portfolio._market_exposure.items()
+        }
 
 
 _DATACLASS_TYPES = {

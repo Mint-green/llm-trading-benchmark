@@ -267,14 +267,19 @@ class ExperimentRunner:
             run_metadata = self.logger.get_current_run()
             if checkpoint["dataset_version"] != self._version_metadata.dataset_version:
                 raise ValueError("Resume dataset version does not match the checkpoint")
-            if checkpoint["code_version"] != self._version_metadata.code_version:
-                raise ValueError("Resume code version does not match the checkpoint")
-            for field, expected in (
-                ("prompt_version", self._version_metadata.prompt_version),
-                ("tool_version", self._version_metadata.tool_version),
-            ):
-                if run_metadata.get(field) != expected:
-                    raise ValueError(f"Resume {field} does not match the run")
+            if self._extend:
+                # Extend only changes end_date — code/prompt/tool versions may differ
+                pass
+            else:
+                # Resume requires exact version match
+                if checkpoint["code_version"] != self._version_metadata.code_version:
+                    raise ValueError("Resume code version does not match the checkpoint")
+                for field, expected in (
+                    ("prompt_version", self._version_metadata.prompt_version),
+                    ("tool_version", self._version_metadata.tool_version),
+                ):
+                    if run_metadata.get(field) != expected:
+                        raise ValueError(f"Resume {field} does not match the run")
             if self._extend:
                 old_config = json.loads(run_metadata["config"])
                 old_comparable = dict(old_config)
@@ -285,7 +290,7 @@ class ExperimentRunner:
                     raise ValueError(
                         "Extend may only change the backtest end date"
                     )
-                if self.config.backtest_end <= run_metadata["end_date"]:
+                if self.config.backtest_end < run_metadata["end_date"]:
                     raise ValueError("Extend end date must be later than the run end")
                 self.logger.prepare_extend(
                     config_dict=self._config_dict,
