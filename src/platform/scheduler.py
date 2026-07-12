@@ -134,25 +134,13 @@ class DecisionScheduler:
         # Check tail guard status
         tail_guard_active, tail_guard_markets = self._check_tail_guard(time_part, open_markets)
 
+        # Separate trigger events by priority
+        p1_events = [e for e in trigger_events if e.priority == "P1"]
+        p2_events = [e for e in trigger_events if e.priority == "P2"]
+
         # Priority 0: System forced events (not handled here, handled by EventDetector)
 
-        # Priority 1: Focused position events from triggers
-        position_events = [e for e in trigger_events if e.priority in ("P1", "P2")]
-        if position_events:
-            # Group by priority
-            p1_events = [e for e in position_events if e.priority == "P1"]
-            if p1_events:
-                return DecisionRequest(
-                    timestamp=timestamp,
-                    decision_type=DecisionType.FOCUSED_POSITION,
-                    priority="P1",
-                    scope_symbols=[e.symbol for e in p1_events],
-                    trigger_events=p1_events,
-                    tail_guard_active=tail_guard_active,
-                    tail_guard_markets=tail_guard_markets,
-                )
-
-        # Priority 2: Close window decisions (30min before close, every 15min)
+        # Priority 1: Close window decisions — full decision with trigger info merged
         for market in open_markets:
             if self._in_close_window(time_part, market):
                 return DecisionRequest(
@@ -160,11 +148,12 @@ class DecisionScheduler:
                     decision_type=DecisionType.FULL_DECISION,
                     priority="P2",
                     scope_market=market.value,
+                    trigger_events=p1_events + p2_events,
                     tail_guard_active=tail_guard_active,
                     tail_guard_markets=tail_guard_markets,
                 )
 
-        # Priority 2: Open window decisions (30min after open, every 15min)
+        # Priority 2: Open window decisions — full decision with trigger info merged
         for market in open_markets:
             if self._in_open_window(time_part, market):
                 return DecisionRequest(
@@ -172,25 +161,37 @@ class DecisionScheduler:
                     decision_type=DecisionType.FULL_DECISION,
                     priority="P2",
                     scope_market=market.value,
+                    trigger_events=p1_events + p2_events,
                     tail_guard_active=tail_guard_active,
                     tail_guard_markets=tail_guard_markets,
                 )
 
-        # Priority 3: Normal full decision (configured interval)
+        # Priority 3: Normal full decision — full decision with trigger info merged
         if self._is_normal_decision_time(time_part):
-            # Check if we already did a full decision recently
             if not self._last_full_decision or self._minutes_since(timestamp, self._last_full_decision) >= self._schedule.normal_interval_minutes:
                 self._last_full_decision = timestamp
                 return DecisionRequest(
                     timestamp=timestamp,
                     decision_type=DecisionType.FULL_DECISION,
                     priority="P3",
+                    trigger_events=p1_events + p2_events,
                     tail_guard_active=tail_guard_active,
                     tail_guard_markets=tail_guard_markets,
                 )
 
-        # Priority 3: Focused events (P2 triggers that weren't P1)
-        p2_events = [e for e in trigger_events if e.priority == "P2"]
+        # Priority 4: Focused position events — only at non-full-decision times
+        if p1_events:
+            return DecisionRequest(
+                timestamp=timestamp,
+                decision_type=DecisionType.FOCUSED_POSITION,
+                priority="P1",
+                scope_symbols=[e.symbol for e in p1_events],
+                trigger_events=p1_events,
+                tail_guard_active=tail_guard_active,
+                tail_guard_markets=tail_guard_markets,
+            )
+
+        # Priority 5: Focused events (P2 triggers)
         if p2_events:
             return DecisionRequest(
                 timestamp=timestamp,

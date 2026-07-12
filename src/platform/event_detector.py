@@ -272,28 +272,37 @@ class EventDetector:
         risk_mode: RiskMode,
     ) -> list[TriggerEvent]:
         """Evaluate triggers for a single plan."""
-        # Find position
+        # Find position — direct match or family root match for futures
         pos = None
+        variant_roots: set[str] = set()
+        if not any(c in symbol for c in (".", "_")):
+            pass  # plain root like "GC", won't match plan symbols
+        else:
+            from src.core.futures_specs import futures_family_variants
+            variant_roots = {v.split(".")[0] for v in futures_family_variants(symbol)}
+
         for key, p in snapshot.positions.items():
             if p.symbol == symbol:
                 pos = p
                 break
+            if p.market == Market.FUTURES and variant_roots:
+                pos_root = p.symbol.split(".")[0]
+                if any(pos_root.startswith(vr) for vr in variant_roots):
+                    pos = p
+                    break
 
         if pos is None:
             return []
 
-        # Get price data
-        bars = all_bars.get(pos.market, {}).get(symbol, [])
+        # Get price data — use contract symbol for bar lookup
+        bars = all_bars.get(pos.market, {}).get(pos.symbol, [])
         if not bars:
             return []
 
         # Get current price and indicators
-        current_price = 0.0
+        # Plan anchors and portfolio marks are USD-normalized; bars may not be.
+        current_price = pos.current_price
         current_atr = 0.0
-        for bar in reversed(bars):
-            if bar.timestamp <= snapshot.timestamp:
-                current_price = bar.close
-                break
 
         snap = self._features.compute(bars, snapshot.timestamp)
         if snap:
@@ -301,7 +310,7 @@ class EventDetector:
 
         # Compute PnL
         pnl_pct = 0.0
-        if pos.avg_cost > 0:
+        if pos.avg_cost > 0 and current_price > 0:
             pnl_pct = (current_price - pos.avg_cost) / pos.avg_cost
 
         # Compute bars since review

@@ -93,7 +93,7 @@ class TestConfig:
         config = TriggerConfig()
         assert config.price_move_pct == 0.02
         assert config.atr_move_multiple == 1.5
-        assert config.pnl_pct_threshold == -0.025
+        assert config.pnl_pct_threshold == -0.03
         assert config.trailing_drawdown_pct == 0.02
         assert config.trailing_atr_multiple == 2.0
         assert config.bars_elapsed == 6
@@ -140,7 +140,7 @@ class TestTriggerEngine:
             current_price=97.0,
             current_pnl_pct=-0.03,
             current_atr=1.0,
-            bars_since_review=2,
+            bars_since_review=6,
             market_regime=RiskMode.GREEN,
             asset_tradable=True,
             market=Market.US,
@@ -182,7 +182,7 @@ class TestTriggerEngine:
             triggers=[PlanTrigger(
                 trigger_type=TriggerType.PNL_PCT,
                 operator="<=",
-                threshold_pct=-0.025,
+                threshold_pct=-0.03,
             )],
         )
         events = self.engine.evaluate_plan(
@@ -190,13 +190,37 @@ class TestTriggerEngine:
             current_price=97.0,
             current_pnl_pct=-0.03,
             current_atr=1.0,
-            bars_since_review=2,
+            bars_since_review=6,
             market_regime=RiskMode.GREEN,
             asset_tradable=True,
             market=Market.US,
         )
         assert len(events) == 1
         assert events[0].trigger_type == TriggerType.PNL_PCT
+
+    def test_pnl_pct_cooldown_suppresses_trigger(self):
+        plan = ActivePlan(
+            plan_id="p1",
+            symbol="AAPL.US",
+            last_review_price=100.0,
+            triggers=[PlanTrigger(
+                trigger_type=TriggerType.PNL_PCT,
+                operator="<=",
+                threshold_pct=-0.03,
+            )],
+        )
+        # Within cooldown (6 bars) — should NOT trigger
+        events = self.engine.evaluate_plan(
+            plan=plan,
+            current_price=97.0,
+            current_pnl_pct=-0.03,
+            current_atr=1.0,
+            bars_since_review=3,
+            market_regime=RiskMode.GREEN,
+            asset_tradable=True,
+            market=Market.US,
+        )
+        assert len(events) == 0
 
     def test_trailing_drawdown_triggered(self):
         plan = ActivePlan(
@@ -216,7 +240,7 @@ class TestTriggerEngine:
             current_price=102.0,
             current_pnl_pct=-0.02,
             current_atr=1.0,
-            bars_since_review=2,
+            bars_since_review=6,
             market_regime=RiskMode.GREEN,
             asset_tradable=True,
             market=Market.US,
@@ -319,12 +343,53 @@ class TestTriggerEngine:
             current_price=47000.0,
             current_pnl_pct=-0.06,
             current_atr=2.0,
-            bars_since_review=2,
+            bars_since_review=6,
             market_regime=RiskMode.GREEN,
             asset_tradable=True,
             market=Market.CRYPTO,
         )
         assert len(events) == 1
+
+    def test_trailing_drawdown_negative_threshold_clamped(self):
+        """Model set -0.03 (negative) — should be clamped to abs(0.03) = 3%."""
+        plan = ActivePlan(
+            plan_id="p1",
+            symbol="AAPL.US",
+            last_review_price=100.0,
+            peak_since_entry=105.0,
+            triggers=[PlanTrigger(
+                trigger_type=TriggerType.TRAILING_DRAWDOWN_PCT,
+                threshold_pct=-0.03,  # negative — wrong!
+                anchor="peak_since_entry",
+            )],
+        )
+        engine = TriggerEngine()
+        # Drawdown 0.95% (105→104) — should NOT trigger (threshold clamped to 3%)
+        events = engine.evaluate_plan(
+            plan=plan,
+            current_price=104.0,
+            current_pnl_pct=-0.01,
+            current_atr=1.0,
+            bars_since_review=6,
+            market_regime=RiskMode.GREEN,
+            asset_tradable=True,
+            market=Market.US,
+        )
+        assert len(events) == 0
+
+        # Drawdown 4.76% (105→100) — should trigger
+        events = engine.evaluate_plan(
+            plan=plan,
+            current_price=100.0,
+            current_pnl_pct=-0.05,
+            current_atr=1.0,
+            bars_since_review=6,
+            market_regime=RiskMode.GREEN,
+            asset_tradable=True,
+            market=Market.US,
+        )
+        assert len(events) == 1
+        assert events[0].trigger_type == TriggerType.TRAILING_DRAWDOWN_PCT
 
     def test_make_default_triggers(self):
         triggers = TriggerEngine.make_default_triggers(

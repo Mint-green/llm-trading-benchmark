@@ -15,14 +15,26 @@ from src.core.futures_specs import DEFAULT_ALLOWED_FUTURES_SYMBOLS
 
 
 @dataclass(frozen=True)
+class TriggerLimitsConfig:
+    """Valid ranges for trigger thresholds. Values outside are clamped."""
+    pnl_pct_min: float = -0.10         # max stop-loss -10%
+    pnl_pct_max: float = 0.20          # max take-profit +20%
+    price_move_min: float = -0.20      # max drop -20%
+    price_move_max: float = 0.20       # max rise +20%
+    trailing_drawdown_min: float = 0.001  # must be positive, min 0.1%
+    trailing_drawdown_max: float = 0.20   # max 20%
+
+
+@dataclass(frozen=True)
 class TriggerConfig:
     """Trigger thresholds for plan monitoring. Market-specific overrides possible."""
     price_move_pct: float = 0.02       # 2% price move triggers review
     atr_move_multiple: float = 1.5     # 1.5x ATR move triggers review
-    pnl_pct_threshold: float = -0.025  # -2.5% PnL triggers stop review
+    pnl_pct_threshold: float = -0.03   # -3% PnL triggers stop review
     trailing_drawdown_pct: float = 0.02  # 2% drawdown from peak
     trailing_atr_multiple: float = 2.0   # 2x ATR from peak
     bars_elapsed: int = 6              # review every 6 bars (30min at 5min/bar)
+    cooldown_bars: int = 6             # cooldown after focused review (30min)
 
 
 @dataclass(frozen=True)
@@ -31,6 +43,13 @@ class CryptoTriggerConfig:
     price_move_pct: float = 0.05       # 5%
     pnl_pct_threshold: float = -0.05   # -5%
     trailing_drawdown_pct: float = 0.03  # 3%
+
+
+@dataclass(frozen=True)
+class StopLossConfig:
+    """Hard stop-loss thresholds. When PnL hits this, force-sell without LLM."""
+    hard_stop_pct: float = -0.05       # -5% for stocks/futures
+    crypto_hard_stop_pct: float = -0.08  # -8% for crypto
 
 
 @dataclass(frozen=True)
@@ -183,6 +202,8 @@ class Config:
     # --- Trigger Thresholds ---
     trigger_config: TriggerConfig = field(default_factory=TriggerConfig)
     crypto_trigger_config: CryptoTriggerConfig = field(default_factory=CryptoTriggerConfig)
+    trigger_limits: TriggerLimitsConfig = field(default_factory=TriggerLimitsConfig)
+    stop_loss: StopLossConfig = field(default_factory=StopLossConfig)
 
     # --- Time System ---
     benchmark_boundary_utc: str = "00:00"  # daily summary at 00:00 UTC
@@ -300,6 +321,9 @@ class Config:
         gold_section_present = "gold" in data
         futures_cfg = data.get("futures", {})
         gold_cfg = data.get("gold", {})
+        trigger_cfg = data.get("trigger", {})
+        crypto_trigger_cfg = trigger_cfg.get("crypto", {})
+        stop_loss_cfg = data.get("stop_loss", {})
 
         # Determine which API to use based on model name
         model_name = model_cfg.get("name", "mimo-v2.5-pro")
@@ -395,6 +419,35 @@ class Config:
                 ),
             ),
         }
+
+        # Trigger and stop-loss configs
+        trigger_limits_cfg = trigger_cfg.get("limits", {})
+        kwargs["trigger_config"] = TriggerConfig(
+            price_move_pct=trigger_cfg.get("price_move_pct", 0.02),
+            atr_move_multiple=trigger_cfg.get("atr_move_multiple", 1.5),
+            pnl_pct_threshold=trigger_cfg.get("pnl_pct_threshold", -0.03),
+            trailing_drawdown_pct=trigger_cfg.get("trailing_drawdown_pct", 0.02),
+            trailing_atr_multiple=trigger_cfg.get("trailing_atr_multiple", 2.0),
+            bars_elapsed=trigger_cfg.get("bars_elapsed", 6),
+            cooldown_bars=trigger_cfg.get("cooldown_bars", 6),
+        )
+        kwargs["crypto_trigger_config"] = CryptoTriggerConfig(
+            price_move_pct=crypto_trigger_cfg.get("price_move_pct", 0.05),
+            pnl_pct_threshold=crypto_trigger_cfg.get("pnl_pct_threshold", -0.05),
+            trailing_drawdown_pct=crypto_trigger_cfg.get("trailing_drawdown_pct", 0.03),
+        )
+        kwargs["trigger_limits"] = TriggerLimitsConfig(
+            pnl_pct_min=trigger_limits_cfg.get("pnl_pct_min", -0.10),
+            pnl_pct_max=trigger_limits_cfg.get("pnl_pct_max", 0.20),
+            price_move_min=trigger_limits_cfg.get("price_move_min", -0.20),
+            price_move_max=trigger_limits_cfg.get("price_move_max", 0.20),
+            trailing_drawdown_min=trigger_limits_cfg.get("trailing_drawdown_min", 0.001),
+            trailing_drawdown_max=trigger_limits_cfg.get("trailing_drawdown_max", 0.20),
+        )
+        kwargs["stop_loss"] = StopLossConfig(
+            hard_stop_pct=stop_loss_cfg.get("hard_stop_pct", -0.05),
+            crypto_hard_stop_pct=stop_loss_cfg.get("crypto_hard_stop_pct", -0.08),
+        )
 
         # Load all API keys (both models)
         kwargs["mimo_pro_api_key"] = api_cfg.get("mimo_v2_5_pro_api_key", "")

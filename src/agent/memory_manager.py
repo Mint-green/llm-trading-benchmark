@@ -25,6 +25,7 @@ from src.core.types import (
     PortfolioTarget, DecisionType,
     Market, TriggerType,
 )
+from src.core.futures_specs import futures_family_variants
 
 
 class MemoryManager:
@@ -131,7 +132,7 @@ class MemoryManager:
         if plan_action == PlanAction.NO_CHANGE:
             return plan
 
-        if plan_action == PlanAction.CREATE:
+        if plan_action == PlanAction.CREATE and plan is None:
             plan = self.create_plan(
                 symbol, current_price, note, timestamp, triggers,
             )
@@ -141,14 +142,11 @@ class MemoryManager:
             return plan
 
         if plan is None:
-            # Create new plan if doesn't exist
-            plan = self.create_plan(
-                symbol, current_price, note, timestamp, triggers,
-            )
-            if note:
-                plan.plan_note = note
-            plan.intended_horizon_bars = intended_horizon_bars
-            return plan
+            return None
+
+        # CREATE is idempotent for a plan established by a successful fill.
+        if plan_action == PlanAction.CREATE:
+            plan_action = PlanAction.UPDATE
 
         if plan_action == PlanAction.UPDATE:
             plan.plan_version += 1
@@ -168,6 +166,16 @@ class MemoryManager:
             return closed_plan
 
         return plan
+
+    def mark_plan_reviewed(self, symbol: str, timestamp: str, current_price: float) -> None:
+        """Advance a plan's review anchor after a focused decision."""
+        plan = self._plans.get(symbol)
+        if plan is None:
+            return
+        plan.last_review_time = timestamp
+        if current_price > 0:
+            plan.last_review_price = current_price
+            plan.peak_since_last_review = current_price
 
     def get_plan(self, symbol: str) -> ActivePlan | None:
         """Get active plan for a symbol."""
@@ -192,6 +200,37 @@ class MemoryManager:
         if plan:
             plan.status = "closed"
         return plan
+
+    def get_plan_by_position(self, position_symbol: str) -> ActivePlan | None:
+        """Find a plan by matching position symbol to plan's family variants.
+
+        For futures: position_symbol='GCQ5.CM' → root='GCQ5' → variant root 'GC' → matches plan 'GOLD_FUT'.
+        For equities/crypto: exact match only.
+        """
+        plan = self._plans.get(position_symbol)
+        if plan is not None:
+            return plan
+        pos_root = position_symbol.split(".")[0]
+        for plan_symbol, plan in self._plans.items():
+            variant_roots = {v.split(".")[0] for v in futures_family_variants(plan_symbol)}
+            if any(pos_root.startswith(vr) for vr in variant_roots):
+                return plan
+        return None
+
+    def close_plan_by_position(self, position_symbol: str, timestamp: str) -> ActivePlan | None:
+        """Close a plan by matching position symbol to family variants."""
+        plan = self._plans.pop(position_symbol, None)
+        if plan:
+            plan.status = "closed"
+            return plan
+        pos_root = position_symbol.split(".")[0]
+        for plan_symbol in list(self._plans):
+            variant_roots = {v.split(".")[0] for v in futures_family_variants(plan_symbol)}
+            if any(pos_root.startswith(vr) for vr in variant_roots):
+                plan = self._plans.pop(plan_symbol)
+                plan.status = "closed"
+                return plan
+        return None
 
     # --- Watchlist ---
 
@@ -341,26 +380,47 @@ class MemoryManager:
             if isinstance(symbol, str) and symbol:
                 self.remove_avoid(symbol)
 
-    def apply_plan_updates(self, updates: list[dict], timestamp: str = "") -> None:
-        """Apply plan_updates from LLM output.
-
-        Supports both the structured v3 format:
-            {"symbol": "AAPL.US", "plan_action": "update", "triggers": [...], "plan_note": "..."}
-        and the older shorthand format:
-            {"symbol": "AAPL.US", "action": "update", "stop_loss": 150, "take_profit": 180}
-        """
+    def apply_plan_updates(self, updates: list[dict], timestamp: str = "") -> list[dict]:
+        """Apply plan_updates and report whether each update was accepted."""
+        results: list[dict] = []
         if not updates:
-            return
+            return results
 
         for update in updates:
             if not isinstance(update, dict):
+                results.append({"status": "rejected", "reason": "update must be an object"})
                 continue
 
             symbol = update.get("symbol", "")
             if not symbol:
+                results.append({"status": "rejected", "reason": "symbol is required"})
                 continue
 
-            action = self._parse_plan_action(update.get("plan_action", update.get("action", "no_change")))
+            # Normalize continuous/root symbols to family symbols for plan lookup.
+            from src.core.futures_specs import get_futures_product_spec
+            if not self._plans.get(symbol):
+                product = get_futures_product_spec(symbol)
+                if product is not None:
+                    symbol = product.family_symbol
+
+            raw_action = update.get("plan_action", update.get("action", "no_change"))
+            action = self._parse_plan_action(raw_action)
+            if action is None:
+                results.append({
+                    "symbol": symbol,
+                    "status": "rejected",
+                    "reason": f"unsupported plan_action: {raw_action}",
+                })
+                continue
+            if action in (PlanAction.UPDATE, PlanAction.CLOSE) and self.get_plan(symbol) is None:
+                results.append({
+                    "symbol": symbol,
+                    "action": action.value,
+                    "status": "rejected",
+                    "reason": "active plan not found",
+                })
+                continue
+
             triggers = self._parse_plan_triggers(update.get("triggers", []))
             note = update.get("plan_note", update.get("note", "")) or ""
             legacy_levels = self._format_legacy_plan_levels(update)
@@ -369,7 +429,7 @@ class MemoryManager:
             intended_horizon_bars = update.get("intended_horizon_bars", 36)
             current_price = update.get("current_price", update.get("entry_price", 0.0)) or 0.0
 
-            self.update_plan(
+            plan = self.update_plan(
                 symbol=symbol,
                 plan_action=action,
                 triggers=triggers or None,
@@ -378,15 +438,21 @@ class MemoryManager:
                 timestamp=timestamp,
                 current_price=float(current_price),
             )
+            results.append({
+                "symbol": symbol,
+                "action": action.value,
+                "status": "applied" if plan is not None else "no_change",
+            })
+        return results
 
     @staticmethod
-    def _parse_plan_action(raw_action) -> PlanAction:
+    def _parse_plan_action(raw_action) -> PlanAction | None:
         if isinstance(raw_action, PlanAction):
             return raw_action
         try:
             return PlanAction(str(raw_action).lower())
         except ValueError:
-            return PlanAction.NO_CHANGE
+            return None
 
     @staticmethod
     def _parse_plan_triggers(raw_triggers) -> list[PlanTrigger]:
@@ -505,6 +571,7 @@ class MemoryManager:
             avoid_list=self.get_avoid_list(),
             recent_feedback=list(self._recent_feedback),
             rolling_behavior_notes=self.get_behavior_notes(),
+            active_plans=self.get_all_plans(),
         )
 
     # --- Helpers ---

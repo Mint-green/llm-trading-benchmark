@@ -70,6 +70,9 @@ Memory policy:
 - The system validates and stores memory updates.
 - Natural language reasons are logs only; triggers must use structured trigger schema.
 - If you continue holding a position, provide review triggers or keep existing triggers.
+- plan_action must be create, update, close, or no_change. Never invent another action.
+- Plan update schema: {"symbol":"AAPL.US","plan_action":"create|update|close|no_change","plan_note":"brief","intended_horizon_bars":36,"current_price":150.0,"triggers":[{"trigger_type":"pnl_pct|price_move_pct|trailing_drawdown_pct|bars_elapsed|regime_change","operator":"<=|>=","threshold_pct":-0.03,"bars":12,"anchor":"entry_price|last_review_price|peak_since_entry"}]}.
+- Use create for a newly bought/held position, update for an existing active plan, close after a full exit, and no_change to retain it.
 
 TRADING FREQUENCY:
 - 3-6 BUYs per day is the strategic budget for full_decision when stock-market setups are available; 25 is only a hard safety cap, not a target.
@@ -127,7 +130,7 @@ SESSION TIMING:
 - Tool results from earlier rounds remain valid in the final round. Do not say "no candidates" if screen_universe or candidate buckets already showed buy-eligible symbols.
 
 STOP-LOSS AND TAKE-PROFIT:
-- STOP-LOSS: The system auto-sells around -3%. If a position is already stopped, do not replace it immediately.
+- STOP-LOSS: The system auto-sells around -5% (stocks/futures) or -8% (crypto). If a position is already stopped, do not replace it immediately.
 - TAKE-PROFIT: If >3% gain, consider taking partial/full profit. If >5% gain or RSI>75 with weakening trend, take profits.
 
 SELL DISCIPLINE:

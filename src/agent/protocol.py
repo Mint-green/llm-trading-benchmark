@@ -25,11 +25,20 @@ class DecisionProtocol:
         if data is None:
             return None
 
+        # Handle multi-symbol focused decision (JSON array)
+        if isinstance(data, list):
+            return self._parse_multi_symbol(data)
+
         action = data.get("action", "").lower()
 
         # Extract memory_updates and plan_updates (v3 format)
         memory_updates = data.get("memory_updates", {})
         plan_updates = data.get("plan_updates", [])
+        # Focused prompts historically used reduce/close as semantic actions.
+        # Normalize them when the model also supplied target positions.
+        if action in ("reduce", "close") and data.get("portfolio_targets"):
+            action = "rebalance"
+
 
         # v3 format: rebalance with portfolio_targets
         if action == "rebalance":
@@ -78,6 +87,51 @@ class DecisionProtocol:
             )
 
         return None
+
+    def _parse_multi_symbol(self, data: list) -> Decision | None:
+        """Parse multi-symbol focused decision (JSON array)."""
+        if not data:
+            return None
+
+        # Combine all plan_updates and trades
+        all_plan_updates = []
+        all_trades = []
+        reasons = []
+
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            all_plan_updates.extend(entry.get("plan_updates", []))
+            reasons.append(entry.get("reason", ""))
+
+            action = entry.get("action", "").lower()
+            if action in ("reduce", "close") and entry.get("portfolio_targets"):
+                action = "rebalance"
+            if action == "rebalance":
+                targets = entry.get("portfolio_targets", [])
+                all_trades.extend(self._targets_to_trades(targets))
+
+        # Merge memory_updates from first element
+        memory_updates = data[0].get("memory_updates", {}) if isinstance(data[0], dict) else {}
+
+        reason = "; ".join(r for r in reasons if r)
+
+        if all_trades:
+            return Decision(
+                action="trade",
+                trades=all_trades,
+                reason=reason,
+                queries=[],
+                memory_updates=memory_updates,
+                plan_updates=all_plan_updates,
+            )
+
+        return Decision(
+            action="hold",
+            reason=reason,
+            memory_updates=memory_updates,
+            plan_updates=all_plan_updates,
+        )
 
     def parse_plan_updates(self, text: str) -> list[dict]:
         """Parse plan_updates from LLM output."""

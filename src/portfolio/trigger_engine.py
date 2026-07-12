@@ -20,7 +20,7 @@ from src.core.types import (
     TriggerType, PlanTrigger, ActivePlan,
     Market, RiskMode,
 )
-from src.core.config import TriggerConfig, CryptoTriggerConfig
+from src.core.config import TriggerConfig, CryptoTriggerConfig, TriggerLimitsConfig
 
 
 @dataclass
@@ -42,9 +42,11 @@ class TriggerEngine:
         self,
         trigger_config: TriggerConfig | None = None,
         crypto_trigger_config: CryptoTriggerConfig | None = None,
+        trigger_limits: TriggerLimitsConfig | None = None,
     ):
         self._config = trigger_config or TriggerConfig()
         self._crypto_config = crypto_trigger_config or CryptoTriggerConfig()
+        self._limits = trigger_limits or TriggerLimitsConfig()
 
     def evaluate_plan(
         self,
@@ -62,7 +64,7 @@ class TriggerEngine:
         Args:
             plan: the active plan to evaluate
             current_price: current price in local currency
-            current_pnl_pct: position PnL as fraction (-0.025 = -2.5%)
+            current_pnl_pct: position PnL as fraction (-0.03 = -3%)
             current_atr: current ATR as % of price
             bars_since_review: bars elapsed since last review
             market_regime: current risk mode
@@ -95,7 +97,20 @@ class TriggerEngine:
         asset_tradable: bool,
         config: TriggerConfig | CryptoTriggerConfig,
     ) -> TriggerEvent | None:
-        """Evaluate a single trigger."""
+        """Evaluate a single trigger with cooldown."""
+
+        # Cooldown: skip price-based triggers if recently reviewed
+        # bars_elapsed and external events are exempt
+        cooldown_triggers = {
+            TriggerType.PRICE_MOVE_PCT,
+            TriggerType.ATR_MOVE,
+            TriggerType.PNL_PCT,
+            TriggerType.TRAILING_DRAWDOWN_PCT,
+            TriggerType.TRAILING_ATR,
+        }
+        cooldown_bars = getattr(config, 'cooldown_bars', 6)
+        if trigger.trigger_type in cooldown_triggers and bars_since_review < cooldown_bars:
+            return None
 
         if trigger.trigger_type == TriggerType.PRICE_MOVE_PCT:
             return self._eval_price_move(trigger, plan, current_price, config)
@@ -122,13 +137,16 @@ class TriggerEngine:
         self, trigger: PlanTrigger, plan: ActivePlan,
         current_price: float, config,
     ) -> TriggerEvent | None:
-        """Evaluate price_move_pct trigger."""
+        """Evaluate price_move_pct trigger with threshold clamping."""
         anchor_price = self._get_anchor_price(trigger.anchor, plan)
         if anchor_price <= 0:
             return None
 
         move_pct = abs(current_price - anchor_price) / anchor_price
         threshold = trigger.threshold_pct or config.price_move_pct
+
+        # Clamp to valid range (magnitude, so use abs and cap at max)
+        threshold = min(self._limits.price_move_max, abs(threshold))
 
         if move_pct >= threshold:
             direction = "up" if current_price > anchor_price else "down"
@@ -187,12 +205,15 @@ class TriggerEngine:
         self, trigger: PlanTrigger, plan: ActivePlan,
         current_pnl_pct: float, config,
     ) -> TriggerEvent | None:
-        """Evaluate pnl_pct trigger."""
+        """Evaluate pnl_pct trigger with threshold clamping."""
         threshold = trigger.threshold_pct
         if isinstance(config, CryptoTriggerConfig):
             threshold = threshold or config.pnl_pct_threshold
         else:
             threshold = threshold or config.pnl_pct_threshold
+
+        # Clamp to valid range
+        threshold = max(self._limits.pnl_pct_min, min(self._limits.pnl_pct_max, threshold))
 
         operator = trigger.operator or "<="
         triggered = False
@@ -220,13 +241,16 @@ class TriggerEngine:
         self, trigger: PlanTrigger, plan: ActivePlan,
         current_price: float, config,
     ) -> TriggerEvent | None:
-        """Evaluate trailing_drawdown_pct trigger."""
+        """Evaluate trailing_drawdown_pct trigger with threshold clamping."""
         peak = plan.peak_since_entry
         if peak <= 0:
             return None
 
         drawdown_pct = (peak - current_price) / peak
         threshold = trigger.threshold_pct or config.trailing_drawdown_pct
+
+        # Clamp to valid range (must be positive)
+        threshold = max(self._limits.trailing_drawdown_min, min(self._limits.trailing_drawdown_max, abs(threshold)))
 
         if drawdown_pct >= threshold:
             return TriggerEvent(
@@ -354,7 +378,7 @@ class TriggerEngine:
         """Create default triggers for a new plan.
 
         Default triggers:
-        - pnl_pct <= -2.5% (stop loss review)
+        - pnl_pct <= -3% (stop loss review)
         - trailing_drawdown_pct 2% (from peak)
         - bars_elapsed 6 (30min review)
         """

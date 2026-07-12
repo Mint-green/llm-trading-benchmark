@@ -158,9 +158,15 @@ def main():
         fork_checkpoint=fork_checkpoint,
         parent_run_id=str(parent_run["run_id"]) if parent_run else "",
     )
-    result = runner.run()
+    try:
+        result = runner.run()
+    except Exception as e:
+        print(f"\nERROR: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return 1
 
-    return 0 if result.total_return >= 0 else 1
+    return 0
 
 
 if __name__ == "__main__":

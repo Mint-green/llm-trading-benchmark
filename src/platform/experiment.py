@@ -13,8 +13,9 @@ from typing import Any
 
 from src.core.config import Config
 from src.core.types import (
-    Market, OrderSide, PortfolioSnapshot, TradeOrder, TradeResult, Decision,
+    Market, OrderSide, PortfolioSnapshot, Position, TradeOrder, TradeResult, Decision,
     AgentRound, BenchmarkResult, DecisionType, RiskMode,
+    PlanTrigger, TriggerType, ExecutionFeedback,
 )
 from src.data.provider import MarketDataProvider
 from src.data.cache_reader import DerivedCacheReader, futures_cache_namespace
@@ -133,6 +134,7 @@ class ExperimentRunner:
         # Trigger engine
         self.trigger_engine = TriggerEngine(
             self.config.trigger_config, self.config.crypto_trigger_config,
+            self.config.trigger_limits,
         )
 
         # Memory manager
@@ -298,6 +300,7 @@ class ExperimentRunner:
                 checkpoint["state_blob"], checkpoint["state_hash"],
             )
             loop_state = restore_runtime_state(self, restored)
+            self._ensure_plans_for_positions(ts=loop_state.get("next_timestamp", ""))
             next_timestamp = loop_state.get("next_timestamp", "")
             start_index = (
                 timestamps.index(next_timestamp)
@@ -332,6 +335,7 @@ class ExperimentRunner:
                 checkpoint["state_blob"], checkpoint["state_hash"],
             )
             loop_state = restore_runtime_state(self, restored)
+            self._ensure_plans_for_positions(ts=loop_state.get("next_timestamp", ""))
             next_timestamp = loop_state.get("next_timestamp", "")
             start_index = (
                 timestamps.index(next_timestamp)
@@ -627,6 +631,7 @@ class ExperimentRunner:
                     if pos.market == Market.CRYPTO:
                         pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost) if pos.avg_cost > 0 else 0
                         pos_pct = pos.market_value / snapshot.total_nav if snapshot.total_nav > 0 else 0
+                        plan = self.memory.get_plan_by_position(pos.symbol)
                         held_info[pos.symbol] = {
                             "market": pos.market,
                             "price": pos.current_price,
@@ -636,7 +641,7 @@ class ExperimentRunner:
                             "hold_bars": 0,
                             "sellable": key not in snapshot.frozen_keys,
                             "tradable": True,  # crypto is always tradable
-                            "plan_status": "",
+                            "plan_status": plan.status if plan else "",
                             "risk_note": "",
                         }
 
@@ -685,6 +690,7 @@ class ExperimentRunner:
                     pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost) if pos.avg_cost > 0 else 0
                     pos_pct = pos.market_value / snapshot.total_nav if snapshot.total_nav > 0 else 0
                     is_tradable = pos.market in open_market_set
+                    plan = self.memory.get_plan_by_position(pos.symbol)
                     held_info[pos.symbol] = {
                         "market": pos.market,
                         "price": pos.current_price,
@@ -694,7 +700,7 @@ class ExperimentRunner:
                         "hold_bars": 0,
                         "sellable": key not in snapshot.frozen_keys,
                         "tradable": is_tradable,
-                        "plan_status": "",
+                        "plan_status": plan.status if plan else "",
                         "risk_note": "market_closed" if not is_tradable else "",
                     }
 
@@ -728,6 +734,7 @@ class ExperimentRunner:
                     benchmark_day=0,
                     bar_index=i,
                     round_num=1,
+                    trigger_events=decision_request.trigger_events if decision_request.trigger_events else None,
                 )
             else:
                 # Focused decision — use simpler context
@@ -749,23 +756,44 @@ class ExperimentRunner:
                 candidate_str, _ = ContextBuilder.build_candidate_layer(candidates, detail_count=0)
                 stock_context = market_summary + "\n\n" + candidate_str
 
-                # Build focused prompt
+                # Build focused prompt (batch all triggered symbols)
                 if decision_request.scope_symbols:
-                    symbol = decision_request.scope_symbols[0]
-                    plan = self.memory.get_plan(symbol)
-                    trigger_detail = {}
-                    if decision_request.trigger_events:
-                        te = decision_request.trigger_events[0]
-                        trigger_detail = te.trigger_detail
+                    # Compute indicators for each triggered symbol
+                    symbol_indicators = {}
+                    scope = []
+                    for sym in decision_request.scope_symbols:
+                        plan = self.memory.get_plan(sym)
+                        trigger_detail = {}
+                        for te in decision_request.trigger_events:
+                            if te.symbol == sym:
+                                trigger_detail = te.trigger_detail
+                                break
+                        scope.append({"symbol": sym, "plan": plan, "trigger_detail": trigger_detail})
 
-                    messages = self.context_builder.build_focused_position_decision(
+                        # Get RSI/ATR/trend from features
+                        pos = next((p for p in snapshot.positions.values() if p.symbol == sym), None)
+                        if pos:
+                            bars = all_bars.get(pos.market, {}).get(sym, [])
+                            if bars:
+                                snap = self.features.compute(bars, ts)
+                                if snap:
+                                    recent = " ".join(
+                                        f"{b.timestamp[-5:]}:{b.close:.2f}" for b in bars[-3:]
+                                    ) if bars else ""
+                                    symbol_indicators[sym] = {
+                                        "rsi": snap.rsi,
+                                        "atr_pct": snap.atr_pct,
+                                        "trend": snap.trend if hasattr(snap, "trend") else "",
+                                        "recent_bars": recent,
+                                    }
+
+                    messages = self.context_builder.build_multi_focused_position_decision(
                         timestamp=ts,
                         snapshot=snapshot,
-                        symbol=symbol,
-                        plan=plan,
-                        trigger_detail=trigger_detail,
+                        scope=scope,
                         priority=decision_request.priority,
                         round_num=1,
+                        symbol_indicators=symbol_indicators,
                     )
                 else:
                     messages = self.context_builder.build_focused_market_decision(
@@ -840,6 +868,7 @@ class ExperimentRunner:
                                 self.futures_account.margin_state,
                             )
                             self._log_new_futures_account_trades(ts)
+                            self._record_execution_memory(result, requested_qty, ts)
                             if result.success:
                                 executed_qty = result.order.quantity
                                 feedback_results.append({
@@ -865,6 +894,7 @@ class ExperimentRunner:
                         if price:
                             result = self.portfolio.process_order(trade, price, ts)
                             self.logger.log_trade(result, ts)
+                            self._record_execution_memory(result, requested_qty, ts)
                             if result.success:
                                 executed_qty = result.order.quantity
                                 if executed_qty != requested_qty:
@@ -905,6 +935,15 @@ class ExperimentRunner:
                                 "quantity": trade.quantity,
                                 "error": "price unavailable",
                             })
+                            self.memory.record_feedback(ExecutionFeedback(
+                                symbol=trade.symbol,
+                                requested_target_pct_nav=trade.allocation_pct or trade.target_notional_pct_nav or 0.0,
+                                filled_target_pct_nav=0.0,
+                                status="FAILED",
+                                reason="price unavailable",
+                                timestamp=ts,
+                            ))
+
 
                     retry_failures = (
                         has_failures and self._should_retry_trade_failures(feedback_results)
@@ -935,6 +974,28 @@ class ExperimentRunner:
             latency_ms = sum(r.latency_ms for r in rounds)
 
             # Log decision event (v3)
+            plan_update_results = []
+            if decision.memory_updates:
+                self.memory.apply_memory_updates(decision.memory_updates, ts)
+            if decision.plan_updates:
+                plan_update_results = self._apply_plan_updates_after_execution(decision.plan_updates, ts)
+
+            if decision_request.decision_type == DecisionType.FOCUSED_POSITION:
+                # Check if model changed trigger thresholds (skip cooldown if so)
+                triggers_changed = self._did_triggers_change(decision.plan_updates)
+                reviewed_snapshot = self.portfolio.get_snapshot(ts)
+                for symbol in decision_request.scope_symbols:
+                    position = next(
+                        (p for p in reviewed_snapshot.positions.values() if p.symbol == symbol),
+                        None,
+                    )
+                    if position is not None:
+                        if triggers_changed:
+                            # Don't mark reviewed — cooldown won't apply
+                            pass
+                        else:
+                            self.memory.mark_plan_reviewed(symbol, ts, position.current_price)
+
             execution_result = json.dumps({
                 "trades": [{"symbol": t.symbol, "side": t.side.value, "qty": t.quantity} for t in decision.trades],
             }) if decision.trades else "{}"
@@ -942,7 +1003,13 @@ class ExperimentRunner:
                 timestamp=ts,
                 decision_type=decision_request.decision_type.value,
                 raw_output=rounds[-1].llm_response if rounds else "",
-                parsed_output=json.dumps({"action": decision.action, "reason": decision.reason}),
+                parsed_output=json.dumps({
+                    "action": decision.action,
+                    "reason": decision.reason,
+                    "memory_updates": decision.memory_updates,
+                    "plan_updates": decision.plan_updates,
+                    "plan_update_results": plan_update_results,
+                }),
                 execution_result=execution_result,
                 latency_ms=int(latency_ms),
             )
@@ -975,11 +1042,6 @@ class ExperimentRunner:
                 ts,
             )
 
-            # Apply LLM memory_updates and plan_updates
-            if decision.memory_updates:
-                self.memory.apply_memory_updates(decision.memory_updates, ts)
-            if decision.plan_updates:
-                self.memory.apply_plan_updates(decision.plan_updates, ts)
 
             # Structured progress output
             print(
@@ -1305,11 +1367,15 @@ class ExperimentRunner:
         self.memory.expire_avoid(ts)
 
         auto_sell_feedback = []
-        stop_loss_pct = -0.03
         for key, pos in list(snapshot.positions.items()):
             if pos.quantity <= 0 or pos.avg_cost <= 0:
                 continue
             pnl_pct = (pos.current_price - pos.avg_cost) / pos.avg_cost
+            # Use market-specific hard stop threshold from config
+            if pos.market == Market.CRYPTO:
+                stop_loss_pct = self.config.stop_loss.crypto_hard_stop_pct
+            else:
+                stop_loss_pct = self.config.stop_loss.hard_stop_pct
             if pnl_pct > stop_loss_pct:
                 continue
             if pos.market not in open_markets or key in snapshot.frozen_keys:
@@ -1515,6 +1581,222 @@ class ExperimentRunner:
             memory_updates=decision.memory_updates,
             plan_updates=decision.plan_updates,
         )
+
+    def _apply_plan_updates_after_execution(
+        self,
+        updates: list[dict],
+        timestamp: str,
+    ) -> list[dict]:
+        """Apply plan changes only when they match the post-execution position state."""
+        snapshot = self.portfolio.get_snapshot(timestamp)
+        positions_by_symbol = {
+            position.symbol: position for position in snapshot.positions.values()
+        }
+        held_symbols = set(positions_by_symbol)
+        results: list[dict] = []
+
+        for update in updates:
+            if not isinstance(update, dict):
+                results.extend(self.memory.apply_plan_updates([update], timestamp))
+                continue
+
+            symbol = update.get("symbol", "")
+
+            # Normalize continuous/root symbols to family symbols
+            from src.core.futures_specs import get_futures_product_spec, futures_family_variants
+            if not self.memory.get_plan(symbol):
+                product = get_futures_product_spec(symbol)
+                if product is not None:
+                    symbol = product.family_symbol
+
+            action = str(update.get("plan_action", update.get("action", "no_change"))).lower()
+
+            # Find matching position (direct match or family root match for futures)
+            matched_position = positions_by_symbol.get(symbol)
+            if matched_position is None:
+                variant_roots = {v.split(".")[0] for v in futures_family_variants(symbol)}
+                for pos in positions_by_symbol.values():
+                    if pos.market == Market.FUTURES:
+                        pos_root = pos.symbol.split(".")[0]
+                        if any(pos_root.startswith(vr) for vr in variant_roots):
+                            matched_position = pos
+                            break
+
+            is_held = matched_position is not None
+            has_plan = self.memory.get_plan(symbol) is not None
+
+            if action == "create" and not is_held:
+                results.append({
+                    "symbol": symbol,
+                    "action": action,
+                    "status": "rejected",
+                    "reason": "position not held after execution",
+                })
+                continue
+            if action == "close" and is_held:
+                results.append({
+                    "symbol": symbol,
+                    "action": action,
+                    "status": "rejected",
+                    "reason": "position still held after execution",
+                })
+                continue
+            if action == "close" and not has_plan:
+                results.append({
+                    "symbol": symbol,
+                    "action": action,
+                    "status": "applied",
+                    "reason": "plan already closed with position exit",
+                })
+                continue
+            normalized_update = dict(update)
+            if matched_position is not None:
+                normalized_update["current_price"] = matched_position.current_price
+            results.extend(self.memory.apply_plan_updates([normalized_update], timestamp))
+
+        return results
+
+    def _did_triggers_change(self, plan_updates: list[dict] | None) -> bool:
+        """Check if model changed trigger thresholds in plan_updates."""
+        if not plan_updates:
+            return False
+        for update in plan_updates:
+            if not isinstance(update, dict):
+                continue
+            triggers = update.get("triggers", [])
+            if triggers:
+                # Model provided triggers — check if they differ from existing plan
+                symbol = update.get("symbol", "")
+                existing = self.memory.get_plan(symbol)
+                if existing is None:
+                    return True  # New plan with triggers
+                # Compare trigger thresholds
+                existing_thresholds = {t.trigger_type: t.threshold_pct for t in existing.triggers}
+                for t in triggers:
+                    trigger_type = t.get("trigger_type", "")
+                    threshold = t.get("threshold_pct", 0)
+                    if existing_thresholds.get(trigger_type) != threshold:
+                        return True
+        return False
+
+    def _record_execution_memory(
+        self,
+        result: TradeResult,
+        requested_qty: float,
+        timestamp: str,
+        sync_plan: bool = True,
+    ) -> None:
+        """Persist execution feedback and keep plans aligned with fills."""
+        order = result.order
+        requested_target = order.allocation_pct or order.target_notional_pct_nav or 0.0
+        adjusted = result.success and result.order.quantity != requested_qty
+        self.memory.record_feedback(ExecutionFeedback(
+            symbol=order.symbol,
+            requested_target_pct_nav=requested_target,
+            filled_target_pct_nav=requested_target if result.success else 0.0,
+            status="ADJUSTED" if adjusted else ("OK" if result.success else "FAILED"),
+            reason=result.error,
+            fees_usd=result.fees,
+            timestamp=timestamp,
+        ))
+
+        if not sync_plan or not result.success:
+            return
+
+        is_futures = order.market == Market.FUTURES or order.asset_type == "futures"
+        position = self._find_position_for_plan(order.symbol, is_futures)
+
+        if order.side == OrderSide.SELL and position is None:
+            self.memory.close_plan_by_position(order.symbol, timestamp)
+            return
+        if position is None:
+            return
+
+        nav = self.portfolio.nav
+        pct_nav = position.market_value / nav if nav > 0 else 0.0
+        plan = self.memory.get_plan_by_position(position.symbol)
+        if plan is not None:
+            plan.current_pct_nav = pct_nav
+            # Update entry price on contract roll (new contract, same family)
+            if is_futures and plan.entry_price != position.avg_cost:
+                plan.entry_price = position.avg_cost
+                plan.peak_since_entry = position.current_price
+                plan.peak_since_last_review = position.current_price
+            return
+
+        if order.side != OrderSide.BUY:
+            return
+
+        self.memory.watch_to_plan(order.symbol)
+        triggers = [
+            PlanTrigger(
+                trigger_type=TriggerType.PNL_PCT,
+                operator="<=",
+                threshold_pct=self.config.trigger_config.pnl_pct_threshold,
+            ),
+        ]
+        self.memory.create_plan(
+            symbol=order.symbol,
+            entry_price=position.avg_cost,
+            entry_reason=order.reason or "successful buy",
+            timestamp=timestamp,
+            triggers=triggers,
+            pct_nav=pct_nav,
+        )
+
+    def _ensure_plans_for_positions(self, ts: str = "") -> None:
+        """Create baseline plans for positions that have none (e.g. after checkpoint resume)."""
+        snapshot = self.portfolio.get_snapshot(ts)
+        for key, pos in snapshot.positions.items():
+            existing = self.memory.get_plan_by_position(pos.symbol)
+            if existing is not None:
+                continue
+            is_futures = pos.market == Market.FUTURES
+            plan_symbol = pos.symbol
+            if is_futures:
+                from src.core.futures_specs import get_futures_product_spec
+                product = get_futures_product_spec(pos.symbol)
+                if product is not None:
+                    plan_symbol = product.family_symbol
+            triggers = [
+                PlanTrigger(
+                    trigger_type=TriggerType.PNL_PCT,
+                    operator="<=",
+                    threshold_pct=self.config.trigger_config.pnl_pct_threshold,
+                ),
+            ]
+            nav = snapshot.total_nav
+            pct_nav = pos.market_value / nav if nav > 0 else 0.0
+            self.memory.create_plan(
+                symbol=plan_symbol,
+                entry_price=pos.avg_cost,
+                entry_reason="checkpoint_resume",
+                timestamp=ts,
+                triggers=triggers,
+                pct_nav=pct_nav,
+            )
+
+    def _find_position_for_plan(self, symbol: str, is_futures: bool) -> Position | None:
+        """Find portfolio position matching a plan symbol.
+
+        For equities/crypto: match by pos.symbol.
+        For futures: match by family variants (e.g. GOLD_FUT → GC, MGC).
+        """
+        positions = self.portfolio.get_snapshot("").positions
+        if not is_futures:
+            for pos in positions.values():
+                if pos.symbol == symbol:
+                    return pos
+            return None
+        from src.core.futures_specs import futures_family_variants
+        variants = futures_family_variants(symbol)
+        variant_roots = {v.split(".")[0] for v in variants}
+        for pos in positions.values():
+            if pos.market == Market.FUTURES:
+                pos_root = pos.symbol.split(".")[0]
+                if any(pos_root.startswith(vr) for vr in variant_roots):
+                    return pos
+        return None
 
     def _update_plan_peaks(self, plans: dict, snapshot) -> None:
         """Update plan peak prices for trailing stop tracking."""

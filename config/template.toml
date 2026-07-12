@@ -2,7 +2,6 @@
 # config.toml 被 .gitignore 排除
 
 [data]
-# 数据源项目地址
 base_dir = ""
 
 [backtest]
@@ -15,7 +14,7 @@ max_decisions = 0       # 0=不限制
 # 模型原名：mimo-v2.5-pro / deepseek-v4-pro
 name = "mimo-v2.5-pro"
 temperature = 0.3
-thinking_enabled = false  # 关闭 thinking 可大幅降低延迟和 token 消耗
+thinking_enabled = false
 max_tokens = 4096
 timeout = 180
 
@@ -27,7 +26,7 @@ deepseek_v4_pro_api_key = ""
 deepseek_v4_pro_base_url = "https://api.deepseek.com"
 
 [portfolio]
-initial_cash = 100000
+initial_cash = 1000000
 
 [portfolio.position_limits]
 max_single = 0.25
@@ -44,14 +43,12 @@ US = 3
 HK = 5
 CN = 3
 CRYPTO = 10
-GOLD = 0
 
 [costs.slippage_bps]
 US = 5
 HK = 5
 CN = 5
 CRYPTO = 10
-GOLD = 5
 
 [gold]
 enabled = true
@@ -68,11 +65,11 @@ max_abs_notional_pct_nav = 1.00
 max_margin_pct_nav = 0.10
 max_risk_budget_pct_nav = 0.01
 roll_days_before_expiry = 5
-commission_per_contract = 2.50  # fixed dollars per contract; not bps
-slippage_bps = 2                # execution slippage only; generic costs.slippage_bps is not used for futures
+commission_per_contract = 2.50
+slippage_bps = 2
 
 [agent]
-max_rounds = 8
+max_rounds = 4
 full_decision_max_rounds = 3
 
 
@@ -91,3 +88,32 @@ enabled = true
 minutes_before_close = 30
 interval_minutes = 15
 include_close_time = false
+
+# Plan trigger thresholds (focused decision when PnL hits this)
+[trigger]
+pnl_pct_threshold = -0.03       # -3% for stocks/futures
+price_move_pct = 0.02
+atr_move_multiple = 1.5
+trailing_drawdown_pct = 0.02
+trailing_atr_multiple = 2.0
+bars_elapsed = 6
+cooldown_bars = 6               # 30min cooldown after focused review
+
+[trigger.crypto]
+pnl_pct_threshold = -0.05       # -5% for crypto
+price_move_pct = 0.05
+trailing_drawdown_pct = 0.03
+
+# Trigger threshold limits (values outside are clamped)
+[trigger.limits]
+pnl_pct_min = -0.10             # max stop-loss -10%
+pnl_pct_max = 0.20              # max take-profit +20%
+price_move_min = -0.20          # max drop -20%
+price_move_max = 0.20           # max rise +20%
+trailing_drawdown_min = 0.001   # must be positive, min 0.1%
+trailing_drawdown_max = 0.20    # max 20%
+
+# Hard stop-loss (force-sell without LLM)
+[stop_loss]
+hard_stop_pct = -0.05           # -5% for stocks/futures
+crypto_hard_stop_pct = -0.08    # -8% for crypto

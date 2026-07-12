@@ -141,6 +141,7 @@ class ContextBuilder(IContextBuilder):
         round_num: int,
         tool_results: str = "",
         decision_type: str = "full_decision",
+        trigger_events: list | None = None,
     ) -> list[dict[str, str]]:
         """Build full decision prompt (v3 style).
 
@@ -171,6 +172,13 @@ class ContextBuilder(IContextBuilder):
         # --- MEMORY_STATE ---
         user_blocks.append(self._format_memory_state(memory_state))
         user_blocks.append("")
+
+        # --- TRIGGER ALERTS (from focused triggers at same timestamp) ---
+        if trigger_events:
+            user_blocks.append("[TRIGGER_ALERTS] Active risk triggers — prioritize these in your decision:")
+            for te in trigger_events:
+                user_blocks.append(f'  {te.symbol} | {te.trigger_type.value} | actual={te.actual_value:.4f} threshold={te.threshold:.4f} | detail={te.trigger_detail}')
+            user_blocks.append("")
 
         # --- CANDIDATE_BUCKETS ---
         user_blocks.append(self._format_candidate_buckets(buckets))
@@ -217,44 +225,100 @@ class ContextBuilder(IContextBuilder):
         round_num: int,
         allowed_actions: str = "hold, reduce, close",
         tool_results: str = "",
+        symbol_indicators: dict | None = None,
     ) -> list[dict[str, str]]:
-        """Build focused position decision prompt."""
-        user_blocks = []
+        """Build focused position decision prompt for one symbol."""
+        return self.build_multi_focused_position_decision(
+            timestamp=timestamp,
+            snapshot=snapshot,
+            scope=[{"symbol": symbol, "plan": plan, "trigger_detail": trigger_detail}],
+            priority=priority,
+            round_num=round_num,
+            allowed_actions=allowed_actions,
+            tool_results=tool_results,
+            symbol_indicators=symbol_indicators,
+        )
 
+    def build_multi_focused_position_decision(
+        self,
+        timestamp: str,
+        snapshot: PortfolioSnapshot,
+        scope: list[dict],
+        priority: str,
+        round_num: int,
+        allowed_actions: str = "hold, reduce, close",
+        tool_results: str = "",
+        symbol_indicators: dict | None = None,
+    ) -> list[dict[str, str]]:
+        """Build focused position decision prompt for one or more symbols.
+
+        Args:
+            scope: list of {"symbol": str, "plan": ActivePlan|None, "trigger_detail": dict}
+            symbol_indicators: optional dict of symbol -> {"rsi": float, "atr_pct": float, "trend": str, "recent_bars": str}
+        """
+        user_blocks = []
+        symbol_indicators = symbol_indicators or {}
+
+        symbols = [s["symbol"] for s in scope]
+        n = len(symbols)
         user_blocks.append("[OBJECTIVE]")
-        user_blocks.append("Handle one focused position event. Do not re-evaluate the whole market. Output JSON only.")
+        if n == 1:
+            user_blocks.append("Handle one focused position event. Do not re-evaluate the whole market. Output JSON only.")
+        else:
+            user_blocks.append(f"Handle {n} focused position events. Prioritize by urgency (worst PnL first). Output JSON only.")
         user_blocks.append("")
 
-        user_blocks.append(f"[DECISION_CONTEXT]")
+        user_blocks.append("[DECISION_CONTEXT]")
         user_blocks.append(f'decision_type: focused_position_decision')
         user_blocks.append(f'timestamp_utc: {timestamp}')
-        user_blocks.append(f'scope: [{symbol}]')
+        user_blocks.append(f'scope: [{", ".join(symbols)}]')
         user_blocks.append("")
 
-        user_blocks.append("[TRIGGER]")
-        user_blocks.append(f'symbol: {symbol}')
-        user_blocks.append(f'priority: {priority}')
-        user_blocks.append(f'detail: {trigger_detail}')
-        user_blocks.append("")
+        for i, entry in enumerate(scope):
+            sym = entry["symbol"]
+            plan = entry.get("plan")
+            trigger_detail = entry.get("trigger_detail", {})
 
-        # Position info
-        pos = snapshot.positions.get(f"*:{symbol}") or self._find_position(snapshot, symbol)
-        if pos:
-            pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost > 0 else 0
-            pos_pct = pos.market_value / snapshot.total_nav * 100 if snapshot.total_nav > 0 else 0
-            user_blocks.append("[POSITION]")
-            user_blocks.append(f'{pos.symbol}|{pos.market.value}|{pos_pct:.1f}%|{pos.avg_cost:.2f}|{pos.current_price:.2f}|{pnl_pct:+.1f}%|sellable')
+            user_blocks.append(f"[POSITION {i+1}]")
+            user_blocks.append(f'symbol: {sym}')
+            user_blocks.append(f'priority: {priority}')
+            user_blocks.append(f'trigger: {trigger_detail}')
+
+            pos = snapshot.positions.get(f"*:{sym}") or self._find_position(snapshot, sym)
+            if pos:
+                pnl_pct = ((pos.current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost > 0 else 0
+                pos_pct = pos.market_value / snapshot.total_nav * 100 if snapshot.total_nav > 0 else 0
+                line = f'{pos.symbol}|{pos.market.value}|{pos_pct:.1f}%|{pos.avg_cost:.2f}|{pos.current_price:.2f}|{pnl_pct:+.1f}%|sellable'
+                # Add indicators if available
+                ind = symbol_indicators.get(sym, {})
+                if ind:
+                    rsi = ind.get("rsi", 0)
+                    atr = ind.get("atr_pct", 0)
+                    trend = ind.get("trend", "")
+                    line += f' | RSI={rsi:.0f} ATR%={atr:.2f} trend={trend}'
+                user_blocks.append(line)
+
+            if plan:
+                user_blocks.append(f'plan: {plan.plan_note} | last_review={plan.last_review_time} | horizon={plan.intended_horizon_bars}bars')
+
+            # Recent bars if available
+            ind = symbol_indicators.get(sym, {})
+            recent = ind.get("recent_bars", "")
+            if recent:
+                user_blocks.append(f'recent_bars: {recent}')
+
             user_blocks.append("")
 
-        if plan:
-            user_blocks.append("[PREVIOUS_PLAN]")
-            user_blocks.append(f'entry_reason: {plan.entry_reason}')
-            user_blocks.append(f'last_review: {plan.last_review_time} @ {plan.last_review_price:.2f}')
-            user_blocks.append(f'horizon: {plan.intended_horizon_bars} bars')
-            user_blocks.append(f'note: {plan.plan_note}')
-            user_blocks.append("")
-
-        user_blocks.append(f"[ALLOWED_ACTIONS] {allowed_actions}")
+        user_blocks.append(f"[ALLOWED_POSITION_ACTIONS] {allowed_actions}")
+        user_blocks.append(
+            "[OUTPUT_ACTION] Use action=hold to keep the position. "
+            "For reduce/close, use action=rebalance and portfolio_targets."
+        )
+        if n > 1:
+            user_blocks.append(
+                "[OUTPUT_FORMAT] Return a JSON array in priority order (worst PnL first). "
+                "Each element: {symbol, action, plan_updates, portfolio_targets, reason}."
+            )
         user_blocks.append("")
 
         if tool_results:
@@ -742,6 +806,16 @@ Avoid trades where expected edge < transaction costs."""
             lines.append(f"recent_feedback: {'; '.join(ra.execution_feedback)}")
         if ra.risk_state_changes:
             lines.append(f"risk_state: {'; '.join(ra.risk_state_changes)}")
+
+        if memory.active_plans:
+            lines.append("active_plans:")
+            lines.append("symbol|status|entry_price|horizon_bars|last_review|note|triggers")
+            for symbol, plan in memory.active_plans.items():
+                triggers = ",".join(t.trigger_type.value for t in plan.triggers) or "none"
+                lines.append(
+                    f"{symbol}|{plan.status}|{plan.entry_price:.4f}|{plan.intended_horizon_bars}|"
+                    f"{plan.last_review_time}|{plan.plan_note}|{triggers}"
+                )
 
         # Watchlist (v4 structured format)
         if memory.watchlist:

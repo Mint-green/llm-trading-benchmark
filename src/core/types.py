@@ -620,3 +620,4 @@ class MemoryState:
     avoid_list: list[AvoidItem] = field(default_factory=list)
     recent_feedback: list[ExecutionFeedback] = field(default_factory=list)
     rolling_behavior_notes: list[str] = field(default_factory=list)
+    active_plans: dict[str, ActivePlan] = field(default_factory=dict)

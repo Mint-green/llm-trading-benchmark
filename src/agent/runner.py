@@ -399,6 +399,8 @@ class AgentRunner(IAgentRunner):
             return 1
         if decision_type == "full_decision":
             return min(self._config.max_agent_rounds, self._config.full_decision_max_rounds)
+        if decision_type == "focused_position_decision":
+            return 2  # 1 tool round + 1 output round
         return self._config.max_agent_rounds
 
     @staticmethod
