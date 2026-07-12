@@ -18,12 +18,36 @@ from src.data.provider import MarketDataProvider
 class FuturesContractResolver:
     """Point-in-time continuous-to-actual futures contract resolver."""
 
-    def __init__(self, config: Config, data_provider: MarketDataProvider):
+    def __init__(
+        self, config: Config, data_provider: MarketDataProvider, cache=None,
+    ):
         self._config = config
         self._data = data_provider
+        self._shared_cache = cache
         self._spec_cache: dict[str, list[FuturesContractSpec]] = {}
+        self._resolve_cache: dict[tuple[str, str], FuturesResolvedContract] = {}
+
+    def clear_caches(self) -> None:
+        """Evict in-memory resolve cache to free RAM."""
+        self._resolve_cache.clear()
 
     def resolve(self, continuous_symbol: str, timestamp: str) -> FuturesResolvedContract:
+        cache_key = (continuous_symbol, timestamp)
+        cached = self._resolve_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if self._shared_cache is not None:
+            cached = self._shared_cache.get_futures_resolution(
+                continuous_symbol, timestamp,
+            )
+            if cached is not None:
+                self._resolve_cache[cache_key] = cached
+                return cached
+        resolved = self._resolve_uncached(continuous_symbol, timestamp)
+        self._resolve_cache[cache_key] = resolved
+        return resolved
+
+    def _resolve_uncached(self, continuous_symbol: str, timestamp: str) -> FuturesResolvedContract:
         if not self._config.futures.enabled:
             return self._empty(continuous_symbol, timestamp, "expired_or_invalid", "futures_disabled")
         if not futures_symbol_allowed(continuous_symbol, self._config.futures.allowed_symbols):

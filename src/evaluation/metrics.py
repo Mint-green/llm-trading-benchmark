@@ -18,14 +18,22 @@ from typing import Any
 
 from src.core.types import PortfolioSnapshot, TradeResult, OrderSide, Market
 from src.core.interfaces import IMetricsEngine
+from src.evaluation.trade_values import trade_cost_usd, trade_fees_usd
 
 
 class MetricsEngine(IMetricsEngine):
     """Computes benchmark performance metrics."""
 
-    def __init__(self, risk_free_rate: float = 0.05):
+    def __init__(
+        self,
+        risk_free_rate: float = 0.05,
+        fx_rates: dict[str, float] | None = None,
+    ):
         """risk_free_rate: annualized (e.g. 0.05 = 5%)"""
         self._risk_free = risk_free_rate
+        self._fx_rates = fx_rates or {
+            "USD": 1.0, "HKD": 7.8, "CNY": 7.25, "JPY": 155.0,
+        }
 
     def compute(
         self, portfolio_history: list[PortfolioSnapshot], trades: list[TradeResult],
@@ -77,12 +85,16 @@ class MetricsEngine(IMetricsEngine):
         win_rate = self._compute_win_rate(buy_trades, sell_trades)
 
         # Turnover
-        total_traded = sum(t.cost for t in successful_trades)
+        total_traded = sum(
+            trade_cost_usd(t, self._fx_rates) for t in successful_trades
+        )
         avg_nav = sum(navs) / len(navs) if navs else 1.0
         turnover = total_traded / avg_nav if avg_nav > 0 else 0.0
 
         # Fees and slippage
-        total_fees = sum(t.fees for t in successful_trades)
+        total_fees = sum(
+            trade_fees_usd(t, self._fx_rates) for t in successful_trades
+        )
 
         futures_trades = [t for t in trades if t.order.market == Market.FUTURES]
         successful_futures = [t for t in successful_trades if t.order.market == Market.FUTURES]
@@ -125,7 +137,9 @@ class MetricsEngine(IMetricsEngine):
             "futures_trades": len(successful_futures),
             "futures_rejected_orders": sum(1 for t in futures_trades if not t.success),
             "futures_roll_trades": futures_roll_trades,
-            "futures_fees_usd": round(sum(t.fees for t in successful_futures), 2),
+            "futures_fees_usd": round(sum(
+                trade_fees_usd(t, self._fx_rates) for t in successful_futures
+            ), 2),
             "max_futures_margin_pct_nav": round(max_futures_margin_pct * 100, 4),
             "futures_margin_warning_count": futures_warning_count,
             "futures_margin_breach_count": futures_breach_count,
@@ -135,7 +149,9 @@ class MetricsEngine(IMetricsEngine):
             "futures_pnl_contribution_pct_nav": round((futures_pnl_delta_sum / initial_nav) * 100, 4) if initial_nav > 0 else 0.0,
             "gold_trades": len(successful_gold),
             "gold_rejected_orders": sum(1 for t in gold_trades if not t.success),
-            "gold_fees_usd": round(sum(t.fees for t in successful_gold), 2),
+            "gold_fees_usd": round(sum(
+                trade_fees_usd(t, self._fx_rates) for t in successful_gold
+            ), 2),
         }
 
     def compute_behavior_metrics(
@@ -171,7 +187,9 @@ class MetricsEngine(IMetricsEngine):
             decision_types[d.get("decision_type", "unknown")] += 1
 
         # Turnover level
-        total_traded = sum(t.cost for t in successful)
+        total_traded = sum(
+            trade_cost_usd(t, self._fx_rates) for t in successful
+        )
         avg_nav = 100000  # placeholder
         turnover_ratio = total_traded / avg_nav if avg_nav > 0 else 0
         if turnover_ratio > 5:
@@ -228,7 +246,9 @@ class MetricsEngine(IMetricsEngine):
 
         # Add realized PnL from trades
         successful = [t for t in trades if t.success]
-        fees_total = sum(t.fees for t in successful)
+        fees_total = sum(
+            trade_fees_usd(t, self._fx_rates) for t in successful
+        )
 
         return {
             "total_pnl_usd": round(total_pnl, 2),
@@ -304,6 +324,7 @@ class MetricsEngine(IMetricsEngine):
         return {k: 0.0 for k in [
             "total_return", "sharpe_ratio", "sortino_ratio", "max_drawdown",
             "volatility", "total_trades", "buy_trades", "sell_trades",
+            "total_fees_usd",
             "win_rate", "turnover", "initial_nav", "final_nav", "total_return_usd",
             "futures_trades", "futures_rejected_orders", "futures_roll_trades",
             "futures_fees_usd", "max_futures_margin_pct_nav",

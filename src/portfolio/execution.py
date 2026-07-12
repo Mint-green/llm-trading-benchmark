@@ -70,6 +70,10 @@ class ExecutionEngine(IExecutionEngine):
             total_bps += self._config.cn_sell_tax_bps
 
         fees_local = notional * (total_bps / 10_000)
+        currency = {
+            Market.HK: "HKD",
+            Market.CN: "CNY",
+        }.get(market, "USD")
 
         return TradeResult(
             order=TradeOrder(
@@ -92,6 +96,13 @@ class ExecutionEngine(IExecutionEngine):
             price=price,
             cost=notional,
             fees=fees_local,
+            metadata={
+                "currency": currency,
+                "cost_local": notional,
+                "fees_local": fees_local,
+                "cost_usd": self._nav.convert_to_usd(notional, currency),
+                "fees_usd": self._nav.convert_to_usd(fees_local, currency),
+            },
         )
 
     @staticmethod

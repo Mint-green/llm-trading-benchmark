@@ -19,7 +19,7 @@ class NavEngine(INavEngine):
         Args:
             fx_rates: mapping from currency code to USD rate (e.g. {"HKD": 7.8} means 1 USD = 7.8 HKD)
         """
-        self._fx_rates = fx_rates
+        self._fx_rates = dict(fx_rates)
 
     def compute_nav(
         self, cash: float, positions: list[Position],

@@ -142,6 +142,20 @@ def test_futures_macro_candidate_groups_standard_and_micro_by_family():
     assert "MCL.FUT:micro" in row.micro_variant
     assert "do_not_split_family_view" in row.execution_guidance
     data.close()
+def test_futures_macro_omits_pilot_target_when_one_contract_is_too_large():
+    cfg = _config(allowed_symbols=("UST10Y_FUT",))
+    data = MarketDataProvider(cfg)
+    resolver = FuturesContractResolver(cfg, data)
+    builder = FuturesCandidateBuilder(data, FeatureGenerator(), resolver)
+
+    rows = builder.build("2026-02-03 18:30", nav=1_000_000, symbols=["UST10Y_FUT"])
+
+    assert len(rows) == 1
+    assert rows[0].ticker == "UST10Y_FUT"
+    assert rows[0].pilot_target_pct_nav == 0.0
+    data.close()
+
+
 def test_100k_account_rejects_standard_gc_contract_when_target_floors_to_zero():
     cfg = _config(max_risk_budget_pct_nav=0.50)
     data = MarketDataProvider(cfg)
@@ -466,9 +480,9 @@ def test_futures_logger_persists_trade_metadata_marks_and_rolls():
     logger.init_run(cfg.to_dict(), model="test", start_date="2026-02-03", end_date="2026-04-01")
 
     opened = account.process_order(TradeOrder(
-        symbol="GC.FUT", market=Market.FUTURES, side=OrderSide.BUY,
+        symbol="GOLD_FUT", market=Market.FUTURES, side=OrderSide.BUY,
         asset_type="futures", action="OPEN_OR_INCREASE", futures_side="long",
-        target_notional_pct_nav=0.50, max_margin_pct_nav=0.50, risk_budget_pct_nav=0.50,
+        target_notional_pct_nav=0.05, max_margin_pct_nav=0.50, risk_budget_pct_nav=0.50,
     ), "2026-02-03 15:00")
     assert opened.success, opened.error
     logger.log_trade(opened, "2026-02-03 15:00")
@@ -479,7 +493,7 @@ def test_futures_logger_persists_trade_metadata_marks_and_rolls():
         logger.log_futures_roll_event(event)
 
     conn = logger._conn
-    trade_meta = conn.execute("SELECT metadata FROM trades WHERE symbol='GC.FUT'").fetchone()[0]
+    trade_meta = conn.execute("SELECT metadata FROM trades WHERE symbol='GOLD_FUT'").fetchone()[0]
     mark_count = conn.execute("SELECT COUNT(*) FROM futures_marks").fetchone()[0]
     roll_count = conn.execute("SELECT COUNT(*) FROM futures_roll_events").fetchone()[0]
 
@@ -527,9 +541,9 @@ def test_runner_combines_and_logs_futures_account_trades_once():
     runner._logged_futures_trade_count = 0
 
     opened = account.process_order(TradeOrder(
-        symbol="GC.FUT", market=Market.FUTURES, side=OrderSide.BUY,
+        symbol="GOLD_FUT", market=Market.FUTURES, side=OrderSide.BUY,
         asset_type="futures", action="OPEN_OR_INCREASE", futures_side="long",
-        target_notional_pct_nav=0.50, max_margin_pct_nav=0.50, risk_budget_pct_nav=0.50,
+        target_notional_pct_nav=0.05, max_margin_pct_nav=0.50, risk_budget_pct_nav=0.50,
     ), "2026-02-03 15:00")
     assert opened.success, opened.error
 
@@ -560,9 +574,9 @@ def test_futures_margin_breach_force_liquidation_enters_trade_history():
     resolver = FuturesContractResolver(cfg, data)
     account = FuturesAccount(cfg, data, resolver, cash_usd=1_000_000)
     opened = account.process_order(TradeOrder(
-        symbol="GC.FUT", market=Market.FUTURES, side=OrderSide.BUY,
+        symbol="GOLD_FUT", market=Market.FUTURES, side=OrderSide.BUY,
         asset_type="futures", action="OPEN_OR_INCREASE", futures_side="long",
-        target_notional_pct_nav=0.50, max_margin_pct_nav=0.50, risk_budget_pct_nav=0.50,
+        target_notional_pct_nav=0.05, max_margin_pct_nav=0.50, risk_budget_pct_nav=0.50,
     ), "2026-02-03 15:00")
     assert opened.success, opened.error
 
@@ -571,6 +585,10 @@ def test_futures_margin_breach_force_liquidation_enters_trade_history():
 
     forced = [t for t in account.trade_history if t.metadata.get("forced_liquidation")]
     assert forced
+    assert forced[0].success, forced[0].error
+    assert forced[0].order.symbol == "GOLD_FUT"
+    assert forced[0].metadata["requested_symbol"] == "GOLD_FUT"
+    assert forced[0].metadata["execution_symbol"] in {"GC.FUT", "MGC.FUT"}
     assert not account.positions
     assert account.margin_state == "OK"
     data.close()

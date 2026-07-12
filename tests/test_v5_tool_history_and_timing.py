@@ -11,7 +11,7 @@ from src.portfolio.nav import NavEngine
 from src.agent.memory_manager import MemoryManager
 from src.data.screener import Screener
 from src.core.config import Config, DecisionScheduleConfig, OpenWindowConfig, CloseWindowConfig
-from src.core.types import Decision, DecisionType, DailySummary, Market, OrderSide, PortfolioSnapshot, Position, TradeOrder, TradeResult, TriggerType
+from src.core.types import Decision, DecisionType, DailySummary, FuturesPosition, Market, OrderSide, PortfolioSnapshot, Position, TradeOrder, TradeResult, TriggerType
 
 
 class _Loader:
@@ -585,6 +585,49 @@ def test_constraint_blocked_buy_is_filtered_before_execution():
     assert "tail_guard" in resolved.reason
     assert resolved.memory_updates == {"daily_thesis": "wait"}
     assert resolved.plan_updates == [{"symbol": "sh.601857", "plan_action": "watch"}]
+
+def test_existing_futures_buy_is_filtered_before_execution():
+    runner = object.__new__(AgentRunner)
+    runner._portfolio = None
+    snapshot = PortfolioSnapshot(
+        timestamp="2026-01-06 16:00",
+        cash=100000.0,
+        positions={},
+        total_nav=100000.0,
+        market_exposure={},
+        fx_rates={"USD": 1.0},
+        futures_positions={
+            "FUTURES:JPY_FX_FUT": FuturesPosition(
+                continuous_symbol="MJY.FUT",
+                contract_ticker="MJYH6",
+                side="long",
+                contracts=1,
+                avg_entry_price=0.00645,
+                previous_mark_price=0.00645,
+                current_price=0.00645,
+                multiplier=1250000,
+                tick_size=0.000001,
+                initial_margin_per_contract=300.0,
+                maintenance_margin_per_contract=250.0,
+                margin_locked=300.0,
+            )
+        },
+    )
+    decision = Decision(
+        action="trade",
+        trades=[TradeOrder("JPY_FX_FUT", Market.FUTURES, OrderSide.BUY, quantity=1, asset_type="futures")],
+        reason="add pilot",
+        memory_updates={"daily_thesis": "already has yen futures"},
+        plan_updates=[{"symbol": "JPY_FX_FUT", "plan_action": "no_change"}],
+    )
+
+    resolved = runner._finalize_trade_decision(decision, snapshot, "2026-01-06 16:00")
+
+    assert resolved.action == "hold"
+    assert "existing-futures BUY" in resolved.reason
+    assert "JPY_FX_FUT" in resolved.reason
+    assert resolved.memory_updates == {"daily_thesis": "already has yen futures"}
+    assert resolved.plan_updates == [{"symbol": "JPY_FX_FUT", "plan_action": "no_change"}]
 
 def test_trade_decision_preserves_memory_and_plan_updates_after_filters():
     runner = object.__new__(AgentRunner)

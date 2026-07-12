@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 from src.core.config import Config
@@ -16,6 +17,7 @@ from src.core.types import (
     AgentRound, BenchmarkResult, DecisionType, RiskMode,
 )
 from src.data.provider import MarketDataProvider
+from src.data.cache_reader import DerivedCacheReader, futures_cache_namespace
 from src.data.universe import UniverseRegistry
 from src.data.features import FeatureGenerator
 from src.data.asset_status import AssetStatusProvider
@@ -38,7 +40,20 @@ from src.agent.runner import AgentRunner
 from src.agent.memory_manager import MemoryManager
 from src.evaluation.metrics import MetricsEngine
 from src.evaluation.behavior import BehaviorAnalyzer
+from .checkpoint import (
+    STATE_SCHEMA_VERSION,
+    capture_runtime_state,
+    decode_checkpoint,
+    encode_checkpoint,
+    restore_runtime_state,
+)
 from .logging import ExperimentLogger
+from .run_identity import (
+    VersionMetadata,
+    build_version_metadata,
+    generate_run_id,
+    reproducible_config_dict,
+)
 from .scheduler import DecisionScheduler, DecisionRequest
 from .event_detector import EventDetector
 
@@ -46,10 +61,41 @@ from .event_detector import EventDetector
 class ExperimentRunner:
     """Orchestrates a complete benchmark experiment."""
 
-    def __init__(self, config: Config, model: str = "mimo-v2.5-pro", db_path: str = "output/results/benchmark.db"):
+    def __init__(
+        self,
+        config: Config,
+        model: str = "mimo-v2.5-pro",
+        db_path: str = "output/results/benchmark.db",
+        run_id: str | None = None,
+        version_metadata: VersionMetadata | None = None,
+        resume: bool = False,
+        extend: bool = False,
+        fork_checkpoint: dict | None = None,
+        parent_run_id: str = "",
+    ):
         self.config = config
         self._model = model
         self._db_path = db_path
+        self._run_id = run_id or generate_run_id(model)
+        self._resume = resume
+        self._extend = extend
+        self._fork_checkpoint = fork_checkpoint
+        self._parent_run_id = parent_run_id
+        self._config_dict = reproducible_config_dict(config)
+        project_root = Path(__file__).resolve().parents[2]
+        self._version_metadata = version_metadata or build_version_metadata(
+            project_root, self._config_dict, config.dataset_version,
+        )
+        cache_namespace = futures_cache_namespace(
+            self._config_dict["futures"], self._version_metadata.code_version,
+        )
+        cache_path = (
+            project_root / "artifacts" / "cache"
+            / f"derived_{config.dataset_version}.db"
+        )
+        self.derived_cache = DerivedCacheReader(
+            cache_path, config.dataset_version, cache_namespace,
+        )
         self._last_light_decision = ""
         self._setup()
 
@@ -64,8 +110,13 @@ class ExperimentRunner:
         forex_db = os.path.join(self.config.stock_data_dir, "FOREX_stock.db")
         self.fx_provider = FxProvider(db_path=forex_db)
         self.index_provider = IndexProvider(data_dir=self.config.stock_data_dir)
-        self.futures_resolver = FuturesContractResolver(self.config, self.data_provider)
-        self.futures_candidates = FuturesCandidateBuilder(self.data_provider, self.features, self.futures_resolver)
+        self.futures_resolver = FuturesContractResolver(
+            self.config, self.data_provider, cache=self.derived_cache,
+        )
+        self.futures_candidates = FuturesCandidateBuilder(
+            self.data_provider, self.features, self.futures_resolver,
+            cache=self.derived_cache,
+        )
 
         # Portfolio layer
         self.nav_engine = NavEngine(self.config.fx_rates)
@@ -98,6 +149,8 @@ class ExperimentRunner:
         self.tool_system = ToolSystem(
             self.data_provider, self.features,
             lambda: self.portfolio.get_snapshot(""),
+            futures_resolver=self.futures_resolver,
+            derived_cache=self.derived_cache,
         )
         # Price lookup: get latest price from bars data
         def price_lookup(symbol: str, market: Market, timestamp: str) -> float | None:
@@ -132,21 +185,38 @@ class ExperimentRunner:
 
     def run(self) -> BenchmarkResult:
         """Run the complete benchmark."""
+        wall_started = time.perf_counter()
         print(f"Starting benchmark: {self.config.backtest_start} → {self.config.backtest_end}")
         print(f"Model: {self.agent._api_model}")
         print(f"Initial NAV: ${self.config.initial_cash:,.2f}")
 
-        # Initialize logger with enhanced run tracking
-        self.logger.init_run(
-            config_dict=self.config.to_dict(),
-            model=self._model,
-            start_date=self.config.backtest_start,
-            end_date=self.config.backtest_end,
-            interval_min=self.config.decision_interval,
-            initial_cash=self.config.initial_cash,
-            thinking_enabled=self.config.thinking_enabled,
-            total_decisions=0,  # will be updated after timestamps generated
-        )
+        # Initialize or attach the per-run result database.
+        if self._resume:
+            self.logger.attach_run(self._run_id)
+        else:
+            self.logger.init_run(
+                run_id=self._run_id,
+                config_dict=self._config_dict,
+                dataset_version=self._version_metadata.dataset_version,
+                prompt_version=self._version_metadata.prompt_version,
+                tool_version=self._version_metadata.tool_version,
+                code_version=self._version_metadata.code_version,
+                config_hash=self._version_metadata.config_hash,
+                benchmark_id=self._version_metadata.benchmark_id,
+                model=self._model,
+                start_date=self.config.backtest_start,
+                end_date=self.config.backtest_end,
+                interval_min=self.config.decision_interval,
+                initial_cash=self.config.initial_cash,
+                thinking_enabled=self.config.thinking_enabled,
+                total_decisions=0,  # will be updated after timestamps generated
+                run_mode="fork" if self._fork_checkpoint else "fresh",
+                parent_run_id=self._parent_run_id,
+                parent_checkpoint_id=(
+                    self._fork_checkpoint["checkpoint_id"]
+                    if self._fork_checkpoint else ""
+                ),
+            )
 
         # Load all data upfront with warmup period for indicator computation
         warmup_days = 14  # need ~14 bars for RSI warmup, load 14 days of history
@@ -185,11 +255,152 @@ class ExperimentRunner:
         last_daily_summary_date = ""
 
         fx_rates = dict(self.config.fx_rates)  # initial FX rates
+        start_index = 0
+
+        if self._resume:
+            self.logger.verify_checkpoint_chain()
+            checkpoint = self.logger.load_latest_checkpoint()
+            if checkpoint is None:
+                raise ValueError(f"Run {self._run_id} has no checkpoint to resume")
+            run_metadata = self.logger.get_current_run()
+            if checkpoint["dataset_version"] != self._version_metadata.dataset_version:
+                raise ValueError("Resume dataset version does not match the checkpoint")
+            if checkpoint["code_version"] != self._version_metadata.code_version:
+                raise ValueError("Resume code version does not match the checkpoint")
+            for field, expected in (
+                ("prompt_version", self._version_metadata.prompt_version),
+                ("tool_version", self._version_metadata.tool_version),
+            ):
+                if run_metadata.get(field) != expected:
+                    raise ValueError(f"Resume {field} does not match the run")
+            if self._extend:
+                old_config = json.loads(run_metadata["config"])
+                old_comparable = dict(old_config)
+                new_comparable = dict(self._config_dict)
+                old_comparable.pop("backtest_end", None)
+                new_comparable.pop("backtest_end", None)
+                if old_comparable != new_comparable:
+                    raise ValueError(
+                        "Extend may only change the backtest end date"
+                    )
+                if self.config.backtest_end <= run_metadata["end_date"]:
+                    raise ValueError("Extend end date must be later than the run end")
+                self.logger.prepare_extend(
+                    config_dict=self._config_dict,
+                    config_hash=self._version_metadata.config_hash,
+                    end_date=self.config.backtest_end,
+                )
+            else:
+                if checkpoint["config_hash"] != self._version_metadata.config_hash:
+                    raise ValueError("Resume config hash does not match the checkpoint")
+                self.logger.mark_running()
+            restored = decode_checkpoint(
+                checkpoint["state_blob"], checkpoint["state_hash"],
+            )
+            loop_state = restore_runtime_state(self, restored)
+            next_timestamp = loop_state.get("next_timestamp", "")
+            start_index = (
+                timestamps.index(next_timestamp)
+                if next_timestamp
+                else min(
+                    int(loop_state["next_timestamp_index"]), len(timestamps),
+                )
+            )
+            decision_count = int(loop_state["decision_count"])
+            daily_start_nav = float(loop_state["daily_start_nav"])
+            daily_decisions = loop_state["daily_decisions"]
+            daily_session_summaries = loop_state["daily_session_summaries"]
+            last_daily_summary_date = loop_state["last_daily_summary_date"]
+            fx_rates = loop_state["fx_rates"]
+            self.nav_engine.update_rates(fx_rates)
+            portfolio_history, all_rounds, all_decisions = (
+                self.logger.load_resume_records()
+            )
+            print(
+                f"Resuming after checkpoint {checkpoint['checkpoint_id']} "
+                f"at timestamp index {start_index}",
+                flush=True,
+            )
+
+        elif self._fork_checkpoint is not None:
+            checkpoint = self._fork_checkpoint
+            if checkpoint["dataset_version"] != self._version_metadata.dataset_version:
+                raise ValueError("Fork dataset version does not match the checkpoint")
+            if checkpoint["code_version"] != self._version_metadata.code_version:
+                raise ValueError("Fork code version does not match the checkpoint")
+            restored = decode_checkpoint(
+                checkpoint["state_blob"], checkpoint["state_hash"],
+            )
+            loop_state = restore_runtime_state(self, restored)
+            next_timestamp = loop_state.get("next_timestamp", "")
+            start_index = (
+                timestamps.index(next_timestamp)
+                if next_timestamp
+                else min(
+                    int(loop_state["next_timestamp_index"]), len(timestamps),
+                )
+            )
+            decision_count = 0
+            daily_start_nav = float(loop_state["daily_start_nav"])
+            daily_decisions = loop_state["daily_decisions"]
+            daily_session_summaries = loop_state["daily_session_summaries"]
+            last_daily_summary_date = loop_state["last_daily_summary_date"]
+            fx_rates = loop_state["fx_rates"]
+            self.nav_engine.update_rates(fx_rates)
+
+            # Parent trades remain represented in positions, cash, and memory.
+            # Child metrics and rows begin at the fork boundary.
+            self.portfolio._trade_history = []
+            self.futures_account.trade_history = []
+            self.futures_account.roll_history = []
+            self._logged_futures_trade_count = 0
+            self._logged_futures_roll_count = 0
+            self.logger.set_initial_state_nav(self.portfolio.nav)
+            print(
+                f"Forking from {checkpoint['checkpoint_id']} "
+                f"at timestamp index {start_index}",
+                flush=True,
+            )
+        def commit_runtime_checkpoint(
+            index: int, timestamp: str, event_type: str,
+        ) -> None:
+            loop_state = {
+                "next_timestamp": (
+                    timestamps[index + 1] if index + 1 < len(timestamps) else ""
+                ),
+                "next_timestamp_index": index + 1,
+                "decision_count": decision_count,
+                "daily_start_nav": daily_start_nav,
+                "daily_decisions": daily_decisions,
+                "daily_session_summaries": daily_session_summaries,
+                "last_daily_summary_date": last_daily_summary_date,
+                "fx_rates": fx_rates,
+            }
+            state = capture_runtime_state(self, loop_state)
+            blob, state_hash = encode_checkpoint(state)
+            self.logger.commit_checkpoint(
+                event_seq=index + 1,
+                timestamp=timestamp,
+                event_type=event_type,
+                next_timestamp=(
+                    timestamps[index + 1] if index + 1 < len(timestamps) else ""
+                ),
+                next_timestamp_index=index + 1,
+                state_schema_version=STATE_SCHEMA_VERSION,
+                state_blob=blob,
+                state_hash=state_hash,
+                config_hash=self._version_metadata.config_hash,
+                dataset_version=self._version_metadata.dataset_version,
+                code_version=self._version_metadata.code_version,
+            )
 
         # Timing accumulators
         _t_fx = _t_reset = _t_prices = _t_snap = _t_markets = _t_sched = _t_event = _t_ctx = _t_llm = _t_log = 0.0
 
         for i, ts in enumerate(timestamps):
+            if i < start_index:
+                continue
+            self.logger.begin_event()
             import time as _time
 
             # Update FX rates at this timestamp
@@ -281,6 +492,7 @@ class ExperimentRunner:
             try:
                 _dt.strptime(ts[:16], "%Y-%m-%d %H:%M")
             except ValueError:
+                commit_runtime_checkpoint(i, ts, "invalid_timestamp")
                 continue
 
             # Session summary at market close + 5min
@@ -329,6 +541,7 @@ class ExperimentRunner:
                         portfolio_history.append(snapshot)
                         if i % 12 == 0:
                             print(f"[{ts}] auto_hold (crypto-wait) | NAV=${self.portfolio.nav:,.0f}", flush=True)
+                        commit_runtime_checkpoint(i, ts, "auto_hold")
                         continue
                 else:
                     # Not at a light_decision boundary — skip
@@ -336,6 +549,7 @@ class ExperimentRunner:
                     portfolio_history.append(snapshot)
                     if i % 12 == 0:
                         print(f"[{ts}] auto_hold (crypto-wait) | NAV=${self.portfolio.nav:,.0f}", flush=True)
+                    commit_runtime_checkpoint(i, ts, "auto_hold")
                     continue
 
             # AUTO_HOLD fast path — timestamp doesn't need a decision (stock market)
@@ -346,6 +560,7 @@ class ExperimentRunner:
                     portfolio_history.append(snapshot)
                     if i % 12 == 0:
                         print(f"[{ts}] auto_hold | NAV=${self.portfolio.nav:,.0f}", flush=True)
+                    commit_runtime_checkpoint(i, ts, "auto_hold")
                     continue
 
                 # Check plan triggers only (lightweight, no volatility spike)
@@ -364,6 +579,7 @@ class ExperimentRunner:
                     portfolio_history.append(snapshot)
                     if i % 12 == 0:
                         print(f"[{ts}] auto_hold | NAV=${self.portfolio.nav:,.0f}", flush=True)
+                    commit_runtime_checkpoint(i, ts, "auto_hold")
                     continue
                 # else: trigger event found — fall through to full processing
 
@@ -392,6 +608,7 @@ class ExperimentRunner:
                 portfolio_history.append(snapshot)
                 if i % 12 == 0:
                     print(f"[{ts}] auto_hold | NAV=${self.portfolio.nav:,.0f}", flush=True)
+                commit_runtime_checkpoint(i, ts, "auto_hold")
                 continue
 
             # Build alerts (position RSI extremes only — actionable signals)
@@ -560,7 +777,7 @@ class ExperimentRunner:
                         round_num=1,
                     )
 
-            _t_ctx = _time.time() - _t_ctx_start
+            _t_ctx += _time.time() - _t_ctx_start
 
             # Run agent
             trade_feedback = "\n".join(auto_sell_feedback) if auto_sell_feedback else ""
@@ -784,6 +1001,9 @@ class ExperimentRunner:
                 total_trades=total_trades,
                 successful_trades=successful_trades,
             )
+            commit_runtime_checkpoint(
+                i, ts, decision_request.decision_type.value,
+            )
 
             if self.config.max_decisions > 0 and decision_count >= self.config.max_decisions:
                 print(f"  Reached max decisions ({self.config.max_decisions})")
@@ -811,23 +1031,36 @@ class ExperimentRunner:
         # Timing summary
         n_ts = len(timestamps)
         n_dec = decision_count
+        per_ts = max(n_ts, 1)
         print(f"\n=== Timing Breakdown ({n_ts} timestamps, {n_dec} decisions) ===")
-        print(f"  FX rates:     {_t_fx:.1f}s ({_t_fx/n_ts*1000:.1f}ms/ts)")
-        print(f"  Snapshot:     {_t_snap:.1f}s ({_t_snap/n_ts*1000:.1f}ms/ts)")
-        print(f"  Scheduler:    {_t_sched:.1f}s ({_t_sched/n_ts*1000:.1f}ms/ts)")
+        print(f"  FX rates:     {_t_fx:.1f}s ({_t_fx/per_ts*1000:.1f}ms/ts)")
+        print(f"  State reset:  {_t_reset:.1f}s ({_t_reset/per_ts*1000:.1f}ms/ts)")
+        print(f"  Prices:       {_t_prices:.1f}s ({_t_prices/per_ts*1000:.1f}ms/ts)")
+        print(f"  Snapshot:     {_t_snap:.1f}s ({_t_snap/per_ts*1000:.1f}ms/ts)")
+        print(f"  Markets:      {_t_markets:.1f}s ({_t_markets/per_ts*1000:.1f}ms/ts)")
+        print(f"  Scheduler:    {_t_sched:.1f}s ({_t_sched/per_ts*1000:.1f}ms/ts)")
+        print(f"  Events:       {_t_event:.1f}s ({_t_event/per_ts*1000:.1f}ms/ts)")
         if n_dec > 0:
             print(f"  Context:      {_t_ctx:.1f}s ({_t_ctx/n_dec:.1f}s/decision)")
             print(f"  LLM calls:    {_t_llm:.1f}s ({_t_llm/n_dec:.1f}s/decision)")
-        _t_total = _t_fx + _t_snap + _t_sched + _t_ctx + _t_llm
-        print(f"  TOTAL:        {_t_total:.1f}s ({_t_total/60:.1f}min)")
+        instrumented = sum((
+            _t_fx, _t_reset, _t_prices, _t_snap, _t_markets,
+            _t_sched, _t_event, _t_ctx, _t_llm, _t_log,
+        ))
+        wall_elapsed = time.perf_counter() - wall_started
+        other = max(0.0, wall_elapsed - instrumented)
+        print(f"  Instrumented: {instrumented:.1f}s ({instrumented/60:.1f}min)")
+        print(f"  Other:        {other:.1f}s ({other/60:.1f}min)")
+        print(f"  WALL CLOCK:   {wall_elapsed:.1f}s ({wall_elapsed/60:.1f}min)")
 
         # Final snapshot
         final_snapshot = self.portfolio.get_snapshot(timestamps[-1] if timestamps else "")
 
         # Append final snapshot to portfolio_history for accurate metrics
         if portfolio_history:
-            # Only append if final snapshot is different from last in history
-            if portfolio_history[-1].timestamp != final_snapshot.timestamp:
+            if portfolio_history[-1].timestamp == final_snapshot.timestamp:
+                portfolio_history[-1] = final_snapshot
+            else:
                 portfolio_history.append(final_snapshot)
         else:
             portfolio_history = [final_snapshot]
@@ -842,7 +1075,10 @@ class ExperimentRunner:
             dataset_version=self.config.dataset_version,
             start_date=self.config.backtest_start,
             end_date=self.config.backtest_end,
-            initial_nav=self.config.initial_cash,
+            initial_nav=(
+                metrics["initial_nav"]
+                if metrics["initial_nav"] > 0 else self.config.initial_cash
+            ),
             final_nav=final_snapshot.total_nav,
             total_return=metrics["total_return"],
             sharpe_ratio=metrics["sharpe_ratio"],
@@ -889,6 +1125,7 @@ class ExperimentRunner:
             getattr(self, "data_provider", None),
             getattr(self, "fx_provider", None),
             getattr(self, "index_provider", None),
+            getattr(self, "derived_cache", None),
         ):
             close = getattr(obj, "close", None)
             if close is None:

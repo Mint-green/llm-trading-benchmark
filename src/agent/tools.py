@@ -247,13 +247,18 @@ class ToolSystem(IToolSystem):
         data_provider: MarketDataProvider,
         feature_gen: FeatureGenerator,
         portfolio_snapshot_fn,  # callable that returns PortfolioSnapshot
+        futures_resolver=None,
+        derived_cache=None,
     ):
         self._data = data_provider
         self._features = feature_gen
         self._get_snapshot = portfolio_snapshot_fn
-        self._futures_resolver = None
-        if hasattr(data_provider, "_config") and hasattr(data_provider, "load_futures_contracts"):
-            self._futures_resolver = FuturesContractResolver(data_provider._config, data_provider)
+        self._derived_cache = derived_cache
+        self._futures_resolver = futures_resolver
+        if self._futures_resolver is None and hasattr(data_provider, "_config") and hasattr(data_provider, "load_futures_contracts"):
+            self._futures_resolver = FuturesContractResolver(
+                data_provider._config, data_provider, cache=derived_cache,
+            )
 
     def get_tool_descriptions(self) -> list[dict]:
         """Return tool schemas for function calling."""
@@ -350,8 +355,16 @@ class ToolSystem(IToolSystem):
     def _futures_signal_features(self, symbol: str, contract: str, timestamp: str) -> dict | None:
         if not contract:
             return None
-        bars = self._data.load_futures_bars(symbol, contract, "2025-10-01", timestamp)
-        snap = self._features.compute(bars, timestamp)
+        snap = None
+        if self._derived_cache is not None:
+            snap = self._derived_cache.get_futures_feature(
+                symbol, contract, timestamp,
+            )
+        if snap is None:
+            bars = self._data.load_futures_bars(
+                symbol, contract, "2025-10-01", timestamp,
+            )
+            snap = self._features.compute(bars, timestamp)
         if snap is None:
             return None
         return {

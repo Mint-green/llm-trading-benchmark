@@ -11,10 +11,16 @@ from typing import Any
 
 from src.core.types import AgentRound, TradeResult, Decision
 from src.core.interfaces import IBehaviorAnalyzer
+from src.evaluation.trade_values import trade_fees_usd
 
 
 class BehaviorAnalyzer(IBehaviorAnalyzer):
     """Analyzes agent behavior patterns."""
+
+    def __init__(self, fx_rates: dict[str, float] | None = None):
+        self._fx_rates = fx_rates or {
+            "USD": 1.0, "HKD": 7.8, "CNY": 7.25, "JPY": 155.0,
+        }
 
     def analyze(
         self, rounds: list[AgentRound], trades: list[TradeResult],
@@ -79,7 +85,9 @@ class BehaviorAnalyzer(IBehaviorAnalyzer):
             "rejection_rate": len(rejected) / max(len(trades), 1) * 100,
             "rejection_reasons": dict(rejection_reasons),
             "markets_traded": dict(markets_traded),
-            "total_fees": sum(t.fees for t in successful),
+            "total_fees_usd": sum(
+                trade_fees_usd(t, self._fx_rates) for t in successful
+            ),
         }
 
     def _latency_stats(self, rounds: list[AgentRound]) -> dict:

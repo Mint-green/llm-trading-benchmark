@@ -10,12 +10,16 @@ Tables:
 """
 
 from __future__ import annotations
+import hashlib
 import json
 import os
 import sqlite3
 from datetime import datetime
 
-from src.core.types import Decision, PortfolioSnapshot, TradeResult, AgentRound, BenchmarkResult, FuturesMarkResult
+from src.core.types import (
+    AgentRound, BenchmarkResult, Decision, FuturesMarkResult, Market,
+    PortfolioSnapshot, TradeResult,
+)
 from src.core.interfaces import IExperimentLogger
 
 
@@ -26,11 +30,18 @@ class ExperimentLogger(IExperimentLogger):
         self._db_path = db_path
         self._conn: sqlite3.Connection | None = None
         self._run_id: str | None = None
+        self._in_event = False
 
     def init_run(
         self,
         config_dict: dict,
+        run_id: str | None = None,
         dataset_version: str = "",
+        prompt_version: str = "",
+        tool_version: str = "",
+        code_version: str = "",
+        config_hash: str = "",
+        benchmark_id: str = "",
         model: str = "",
         start_date: str = "",
         end_date: str = "",
@@ -38,6 +49,9 @@ class ExperimentLogger(IExperimentLogger):
         initial_cash: float = 100000,
         thinking_enabled: bool = False,
         total_decisions: int = 0,
+        run_mode: str = "fresh",
+        parent_run_id: str = "",
+        parent_checkpoint_id: str = "",
     ) -> str:
         """Initialize a new experiment run. Returns run_id."""
         os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
@@ -46,23 +60,26 @@ class ExperimentLogger(IExperimentLogger):
         self._conn.execute("PRAGMA journal_mode=TRUNCATE")
         self._create_tables()
 
-        self._run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
         now = datetime.now().isoformat()
         self._conn.execute(
             """INSERT INTO benchmark_runs (
                 run_id, model, start_date, end_date, interval_min, initial_cash,
                 thinking_enabled, config, dataset_version, status, created_at,
                 decisions_made, total_decisions, current_nav,
-                total_trades, successful_trades, started_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                total_trades, successful_trades, started_at, prompt_version,
+                tool_version, code_version, config_hash, benchmark_id,
+                run_mode, parent_run_id, parent_checkpoint_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 self._run_id, model, start_date, end_date, interval_min, initial_cash,
                 thinking_enabled, json.dumps(config_dict), dataset_version, "running", now,
                 0, total_decisions, initial_cash,
-                0, 0, now,
+                0, 0, now, prompt_version, tool_version, code_version, config_hash,
+                benchmark_id, run_mode, parent_run_id, parent_checkpoint_id,
             ),
         )
-        self._conn.commit()
+        self._commit()
         return self._run_id
 
     def _create_tables(self) -> None:
@@ -77,6 +94,11 @@ class ExperimentLogger(IExperimentLogger):
                 dataset_version TEXT,
                 prompt_version TEXT,
                 tool_version TEXT,
+                code_version TEXT,
+                config_hash TEXT,
+                run_mode TEXT DEFAULT 'fresh',
+                parent_run_id TEXT,
+                parent_checkpoint_id TEXT,
                 start_date TEXT,
                 end_date TEXT,
                 interval_min INTEGER,
@@ -349,6 +371,28 @@ class ExperimentLogger(IExperimentLogger):
             );
 
             -- v3 tables: Metrics daily
+            CREATE TABLE IF NOT EXISTS run_checkpoints (
+                checkpoint_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                event_seq INTEGER NOT NULL,
+                timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                next_timestamp TEXT NOT NULL,
+                next_timestamp_index INTEGER NOT NULL,
+                state_schema_version INTEGER NOT NULL,
+                state_blob BLOB NOT NULL,
+                state_hash TEXT NOT NULL,
+                previous_checkpoint_hash TEXT,
+                config_hash TEXT NOT NULL,
+                dataset_version TEXT NOT NULL,
+                code_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(run_id, event_seq),
+                FOREIGN KEY (run_id) REFERENCES benchmark_runs(run_id)
+            );
+
             CREATE TABLE IF NOT EXISTS metrics_daily (
                 metrics_id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL,
@@ -376,6 +420,166 @@ class ExperimentLogger(IExperimentLogger):
         self._ensure_column("portfolio_snapshots", "futures_margin_locked", "REAL DEFAULT 0")
         self._ensure_column("portfolio_snapshots", "futures_margin_state", "TEXT DEFAULT 'OK'")
         self._ensure_column("portfolio_snapshots", "futures_pnl_delta", "REAL DEFAULT 0")
+        self._ensure_column("benchmark_runs", "code_version", "TEXT")
+        self._ensure_column("benchmark_runs", "config_hash", "TEXT")
+        self._ensure_column("benchmark_runs", "run_mode", "TEXT DEFAULT 'fresh'")
+        self._ensure_column("benchmark_runs", "parent_run_id", "TEXT")
+        self._ensure_column("benchmark_runs", "parent_checkpoint_id", "TEXT")
+        self._ensure_column("run_checkpoints", "event_id", "TEXT")
+        self._ensure_column("run_checkpoints", "next_timestamp", "TEXT")
+        self._ensure_column("run_checkpoints", "previous_checkpoint_hash", "TEXT")
+        self._ensure_column("run_checkpoints", "dataset_version", "TEXT")
+        self._ensure_column("run_checkpoints", "status", "TEXT")
+
+    def _commit(self) -> None:
+        if not self._in_event:
+            self._conn.commit()
+
+    def begin_event(self) -> None:
+        if self._in_event:
+            raise RuntimeError("An event transaction is already active")
+        self._conn.execute("BEGIN")
+        self._in_event = True
+
+    def rollback_event(self) -> None:
+        if self._in_event:
+            self._conn.rollback()
+            self._in_event = False
+
+    def commit_checkpoint(
+        self,
+        *,
+        event_seq: int,
+        timestamp: str,
+        event_type: str,
+        next_timestamp: str,
+        next_timestamp_index: int,
+        state_schema_version: int,
+        state_blob: bytes,
+        state_hash: str,
+        config_hash: str,
+        dataset_version: str,
+        code_version: str,
+    ) -> str:
+        if not self._in_event:
+            raise RuntimeError("Checkpoint must commit an active event transaction")
+        checkpoint_id = f"cp_{self._run_id}_{event_seq:08d}"
+        event_id = f"evt_{self._run_id}_{event_seq:08d}"
+        previous = self._conn.execute(
+            """SELECT state_hash FROM run_checkpoints
+               WHERE run_id = ? AND status = 'COMMITTED'
+               ORDER BY event_seq DESC LIMIT 1""",
+            (self._run_id,),
+        ).fetchone()
+        previous_hash = previous[0] if previous else None
+        self._conn.execute(
+            """INSERT INTO run_checkpoints (
+                checkpoint_id, run_id, event_id, event_seq, timestamp, event_type,
+                next_timestamp, next_timestamp_index, state_schema_version, state_blob,
+                state_hash, previous_checkpoint_hash, config_hash,
+                dataset_version, code_version, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                checkpoint_id, self._run_id, event_id, event_seq, timestamp,
+                event_type, next_timestamp, next_timestamp_index,
+                state_schema_version, state_blob, state_hash, previous_hash, config_hash,
+                dataset_version, code_version, "COMMITTED",
+                datetime.now().isoformat(),
+            ),
+        )
+        self._conn.commit()
+        self._in_event = False
+        return checkpoint_id
+
+    def verify_checkpoint_chain(self) -> None:
+        rows = self._conn.execute(
+            """SELECT state_blob, state_hash, previous_checkpoint_hash
+               FROM run_checkpoints
+               WHERE run_id = ? AND status = 'COMMITTED'
+               ORDER BY event_seq""",
+            (self._run_id,),
+        ).fetchall()
+        previous_hash = None
+        for blob, state_hash, linked_hash in rows:
+            if hashlib.sha256(blob).hexdigest() != state_hash:
+                raise ValueError("Checkpoint state hash mismatch")
+            if linked_hash != previous_hash:
+                raise ValueError("Checkpoint hash chain mismatch")
+            previous_hash = state_hash
+    def get_current_run(self) -> dict:
+        row = self._conn.execute(
+            "SELECT * FROM benchmark_runs WHERE run_id = ?",
+            (self._run_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Run not found: {self._run_id}")
+        columns = [item[0] for item in self._conn.execute(
+            "SELECT * FROM benchmark_runs LIMIT 0"
+        ).description]
+        return dict(zip(columns, row))
+
+    def set_initial_state_nav(self, nav: float) -> None:
+        self._conn.execute(
+            """UPDATE benchmark_runs SET initial_cash = ?, current_nav = ?
+               WHERE run_id = ?""",
+            (nav, nav, self._run_id),
+        )
+        self._conn.commit()
+
+    def mark_running(self) -> None:
+        self._conn.execute(
+            """UPDATE benchmark_runs SET status = 'running', error_message = NULL
+               WHERE run_id = ?""",
+            (self._run_id,),
+        )
+        self._conn.commit()
+
+    def prepare_extend(
+        self,
+        *,
+        config_dict: dict,
+        config_hash: str,
+        end_date: str,
+    ) -> None:
+        self._conn.execute(
+            """UPDATE benchmark_runs
+               SET config = ?, config_hash = ?, end_date = ?,
+                   status = 'running', completed_at = NULL,
+                   finished_at = NULL, result = NULL
+               WHERE run_id = ?""",
+            (
+                json.dumps(config_dict, ensure_ascii=False),
+                config_hash,
+                end_date,
+                self._run_id,
+            ),
+        )
+        self._conn.commit()
+    def load_latest_checkpoint(self) -> dict | None:
+        row = self._conn.execute(
+            """SELECT * FROM run_checkpoints
+               WHERE run_id = ? AND status = 'COMMITTED'
+               ORDER BY event_seq DESC LIMIT 1""",
+            (self._run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        columns = [item[0] for item in self._conn.execute(
+            "SELECT * FROM run_checkpoints LIMIT 0"
+        ).description]
+        return dict(zip(columns, row))
+
+    def attach_run(self, run_id: str) -> None:
+        os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
+        self._conn = sqlite3.connect(self._db_path)
+        self._conn.execute("PRAGMA journal_mode=TRUNCATE")
+        self._create_tables()
+        exists = self._conn.execute(
+            "SELECT 1 FROM benchmark_runs WHERE run_id = ?", (run_id,),
+        ).fetchone()
+        if exists is None:
+            raise ValueError(f"Run not found: {run_id}")
+        self._run_id = run_id
 
     def _ensure_column(self, table: str, column: str, ddl: str) -> None:
         cols = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -394,7 +598,7 @@ class ExperimentLogger(IExperimentLogger):
             (self._run_id, timestamp, decision_type, decision.action, trades_json,
              decision.reason, snapshot.total_nav),
         )
-        self._conn.commit()
+        self._commit()
 
     def log_trade(self, result: TradeResult, timestamp: str = "") -> None:
         self._conn.execute(
@@ -407,7 +611,7 @@ class ExperimentLogger(IExperimentLogger):
              1 if result.success else 0, result.error,
              json.dumps(result.metadata, ensure_ascii=False)),
         )
-        self._conn.commit()
+        self._commit()
 
     def log_llm_call(
         self, timestamp: str, round_num: int, model: str,
@@ -421,7 +625,7 @@ class ExperimentLogger(IExperimentLogger):
              prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, latency_ms,
              reasoning, response),
         )
-        self._conn.commit()
+        self._commit()
 
     def log_round(self, round_data: AgentRound, timestamp: str = "") -> None:
         """Log an agent round (v3: includes timestamp)."""
@@ -432,7 +636,7 @@ class ExperimentLogger(IExperimentLogger):
              round_data.decision.action, round_data.llm_response,
              round_data.tool_results, round_data.latency_ms),
         )
-        self._conn.commit()
+        self._commit()
 
     def log_tool_call(
         self, timestamp: str, tool_name: str, tool_args: dict,
@@ -448,7 +652,7 @@ class ExperimentLogger(IExperimentLogger):
             (tool_call_id, self._run_id, timestamp, tool_name, args_json,
              tool_result, result_hash, latency_ms, datetime.now().isoformat()),
         )
-        self._conn.commit()
+        self._commit()
 
     def log_decision_event(
         self, timestamp: str, decision_type: str,
@@ -467,7 +671,7 @@ class ExperimentLogger(IExperimentLogger):
              prompt_snapshot, raw_output, parsed_output, execution_result,
              token_usage, latency_ms, datetime.now().isoformat()),
         )
-        self._conn.commit()
+        self._commit()
 
     def log_snapshot(self, snapshot: PortfolioSnapshot) -> None:
         positions_json = json.dumps({
@@ -496,7 +700,7 @@ class ExperimentLogger(IExperimentLogger):
              snapshot.futures_margin_locked, snapshot.futures_margin_state,
              snapshot.futures_pnl_delta),
         )
-        self._conn.commit()
+        self._commit()
 
     def log_futures_mark(self, mark: FuturesMarkResult, cash_usd_after: float) -> None:
         self._conn.execute(
@@ -507,7 +711,7 @@ class ExperimentLogger(IExperimentLogger):
              mark.cumulative_variation_pnl, cash_usd_after, mark.margin_locked,
              mark.margin_state),
         )
-        self._conn.commit()
+        self._commit()
 
     def log_futures_roll_event(self, event: dict) -> None:
         self._conn.execute(
@@ -521,7 +725,7 @@ class ExperimentLogger(IExperimentLogger):
              event.get("selection_method", ""), event.get("status", ""),
              event.get("reject_reason", ""), json.dumps(event, ensure_ascii=False)),
         )
-        self._conn.commit()
+        self._commit()
 
     def update_progress(
         self,
@@ -542,7 +746,7 @@ class ExperimentLogger(IExperimentLogger):
             WHERE run_id = ?""",
             (last_decision_ts, decisions_made, current_nav, total_trades, successful_trades, self._run_id),
         )
-        self._conn.commit()
+        self._commit()
 
     def mark_completed(self) -> None:
         """Mark run as completed."""
@@ -550,7 +754,7 @@ class ExperimentLogger(IExperimentLogger):
             "UPDATE benchmark_runs SET status = 'completed', completed_at = ?, finished_at = ? WHERE run_id = ?",
             (datetime.now().isoformat(), datetime.now().isoformat(), self._run_id),
         )
-        self._conn.commit()
+        self._commit()
 
     def mark_failed(self, error_message: str) -> None:
         """Mark run as failed."""
@@ -558,7 +762,7 @@ class ExperimentLogger(IExperimentLogger):
             "UPDATE benchmark_runs SET status = 'failed', error_message = ?, completed_at = ? WHERE run_id = ?",
             (error_message, datetime.now().isoformat(), self._run_id),
         )
-        self._conn.commit()
+        self._commit()
 
     def save_results(self, result: BenchmarkResult) -> str:
         result_json = json.dumps({
@@ -573,14 +777,126 @@ class ExperimentLogger(IExperimentLogger):
             "UPDATE benchmark_runs SET finished_at = ?, result = ?, status = 'completed', completed_at = ? WHERE run_id = ?",
             (datetime.now().isoformat(), result_json, datetime.now().isoformat(), self._run_id),
         )
-        self._conn.commit()
+        self._commit()
         return self._db_path
 
+    def load_resume_records(
+        self,
+    ) -> tuple[list[PortfolioSnapshot], list[AgentRound], list[dict]]:
+        snapshot_rows = self._conn.execute(
+            """SELECT timestamp, cash, nav, market_exposure,
+                      futures_margin_locked, futures_margin_state,
+                      futures_pnl_delta
+               FROM portfolio_snapshots
+               WHERE run_id = ? ORDER BY id""",
+            (self._run_id,),
+        ).fetchall()
+        snapshots = []
+        for row in snapshot_rows:
+            exposure_raw = json.loads(row[3] or "{}")
+            exposure = {Market(key): value for key, value in exposure_raw.items()}
+            snapshots.append(PortfolioSnapshot(
+                timestamp=row[0],
+                cash=row[1],
+                positions={},
+                total_nav=row[2],
+                market_exposure=exposure,
+                fx_rates={},
+                futures_margin_locked=row[4] or 0.0,
+                futures_margin_state=row[5] or "OK",
+                futures_pnl_delta=row[6] or 0.0,
+            ))
+
+        tool_rows = self._conn.execute(
+            """SELECT decision_timestamp, tool_name FROM tool_calls
+               WHERE run_id = ? ORDER BY created_at, tool_call_id""",
+            (self._run_id,),
+        ).fetchall()
+        tools_by_timestamp: dict[str, list[dict[str, str]]] = {}
+        for timestamp, tool_name in tool_rows:
+            tools_by_timestamp.setdefault(timestamp, []).append({"tool": tool_name})
+        round_rows = self._conn.execute(
+            """SELECT decision_timestamp, round_num, action, llm_response,
+                      tool_results, latency_ms
+               FROM agent_rounds WHERE run_id = ? ORDER BY id""",
+            (self._run_id,),
+        ).fetchall()
+        rounds = [
+            AgentRound(
+                round_num=row[1],
+                decision=Decision(
+                    action=row[2] or "hold",
+                    queries=tools_by_timestamp.get(row[0], []),
+                ),
+                llm_response=row[3] or "",
+                tool_results=row[4] or "",
+                latency_ms=row[5] or 0.0,
+            )
+            for row in round_rows
+        ]
+
+        decision_rows = self._conn.execute(
+            """SELECT timestamp, action, trades, decision_type
+               FROM decisions WHERE run_id = ? ORDER BY id""",
+            (self._run_id,),
+        ).fetchall()
+        decisions = [
+            {
+                "timestamp": row[0],
+                "action": row[1],
+                "symbol": row[2] or "hold",
+                "market": row[3] or "",
+            }
+            for row in decision_rows
+        ]
+        return snapshots, rounds, decisions
     def close(self) -> None:
         if self._conn:
             self._conn.close()
             self._conn = None
 
+    @staticmethod
+    def read_checkpoint(
+        db_path: str, checkpoint_id: str | None = None,
+    ) -> tuple[dict, dict]:
+        if not os.path.exists(db_path):
+            raise FileNotFoundError(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        chain_rows = conn.execute(
+            """SELECT state_blob, state_hash, previous_checkpoint_hash
+               FROM run_checkpoints WHERE status = 'COMMITTED'
+               ORDER BY event_seq"""
+        ).fetchall()
+        previous_hash = None
+        for item in chain_rows:
+            if hashlib.sha256(item["state_blob"]).hexdigest() != item["state_hash"]:
+                conn.close()
+                raise ValueError("Parent checkpoint state hash mismatch")
+            if item["previous_checkpoint_hash"] != previous_hash:
+                conn.close()
+                raise ValueError("Parent checkpoint hash chain mismatch")
+            previous_hash = item["state_hash"]
+        if checkpoint_id:
+            checkpoint = conn.execute(
+                "SELECT * FROM run_checkpoints WHERE checkpoint_id = ? AND status = 'COMMITTED'",
+                (checkpoint_id,),
+            ).fetchone()
+        else:
+            checkpoint = conn.execute(
+                "SELECT * FROM run_checkpoints WHERE status = 'COMMITTED' ORDER BY event_seq DESC LIMIT 1"
+            ).fetchone()
+        if checkpoint is None:
+            conn.close()
+            raise ValueError("Checkpoint not found")
+        run = conn.execute(
+            "SELECT * FROM benchmark_runs WHERE run_id = ?",
+            (checkpoint["run_id"],),
+        ).fetchone()
+        conn.close()
+        if run is None:
+            raise ValueError("Parent run metadata not found")
+        return dict(checkpoint), dict(run)
     @staticmethod
     def get_latest_run(db_path: str) -> dict | None:
         """Get the latest run from database."""

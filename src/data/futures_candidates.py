@@ -18,10 +18,14 @@ from src.data.provider import MarketDataProvider
 class FuturesCandidateBuilder:
     """Build compact futures_macro rows for prompt context."""
 
-    def __init__(self, data: MarketDataProvider, features: FeatureGenerator, resolver: FuturesContractResolver):
+    def __init__(
+        self, data: MarketDataProvider, features: FeatureGenerator,
+        resolver: FuturesContractResolver, cache=None,
+    ):
         self._data = data
         self._features = features
         self._resolver = resolver
+        self._shared_cache = cache
 
     def build(self, timestamp: str, nav: float, symbols: list[str] | None = None) -> list[CandidateInBucket]:
         symbols = symbols or list(self._resolver._config.futures.allowed_symbols)
@@ -151,7 +155,15 @@ class FuturesCandidateBuilder:
         )
 
     def _snapshot(self, symbol: str, contract_ticker: str, timestamp: str):
-        bars = self._data.load_futures_bars(symbol, contract_ticker, "2025-10-01", timestamp)
+        if self._shared_cache is not None:
+            cached = self._shared_cache.get_futures_feature(
+                symbol, contract_ticker, timestamp,
+            )
+            if cached is not None:
+                return cached
+        bars = self._data.load_futures_bars(
+            symbol, contract_ticker, "2025-10-01", timestamp,
+        )
         return self._features.compute(bars, timestamp)
 
     def _variant_summary(self, symbol: str | None, variants: list[tuple[str, FuturesResolvedContract, object, str]], nav: float) -> str:

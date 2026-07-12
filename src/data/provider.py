@@ -11,8 +11,9 @@ PATH CONFIG: paths are defined in Config (core/config.py):
 """
 
 from __future__ import annotations
+from bisect import bisect_right
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from src.core.types import Market, OHLCVBar
@@ -27,6 +28,29 @@ class MarketDataProvider(IMarketDataProvider):
         self._config = config
         self._connections: dict[Market, sqlite3.Connection] = {}
         self._universe_cache: dict[Market, list[str]] = {}
+        self._futures_bars_cache: dict[tuple[str, str, str, str], list[OHLCVBar]] = {}
+        self._futures_history_cache: dict[
+            tuple[str, str, str], tuple[str, list[str], list[OHLCVBar]]
+        ] = {}
+        self._futures_contract_history_cache: dict[
+            tuple[str, str], tuple[str, list[str], list[OHLCVBar]]
+        ] = {}
+        self._futures_first_bar_cache: dict[tuple[str, str], str | None] = {}
+        self._futures_last_bar_cache: dict[tuple[str, str, str], OHLCVBar | None] = {}
+        self._futures_next_bar_cache: dict[tuple[str, str, str], OHLCVBar | None] = {}
+        self._futures_liquidity_cache: dict[tuple[str, str, str], tuple[float, float]] = {}
+
+    def clear_futures_caches(self) -> None:
+        """Evict per-timestamp futures caches to free RAM.
+
+        Preserves _futures_history_cache and _futures_contract_history_cache
+        since they hold static pre-loaded bars that are expensive to rebuild.
+        """
+        self._futures_bars_cache.clear()
+        self._futures_first_bar_cache.clear()
+        self._futures_last_bar_cache.clear()
+        self._futures_next_bar_cache.clear()
+        self._futures_liquidity_cache.clear()
 
     def _get_conn(self, market: Market) -> sqlite3.Connection:
         if market not in self._connections:
@@ -195,46 +219,78 @@ class MarketDataProvider(IMarketDataProvider):
         start: str, end: str,
     ) -> list[OHLCVBar]:
         """Load bars for one actual futures contract, never a mixed continuous series."""
+        cache_key = (continuous_symbol, contract_ticker, start, end)
+        if cache_key in self._futures_bars_cache:
+            return self._futures_bars_cache[cache_key]
         conn = self._get_conn(Market.FUTURES)
         table = self._config.db_tables[Market.FUTURES]
         start_dt = self._normalize_timestamp(start)
         end_dt = self._normalize_timestamp(end, end_of_day=True)
-        rows = conn.execute(
-            f"""
-            SELECT datetime_utc, open, high, low, close, volume
-            FROM {table}
-            WHERE symbol = ?
-              AND contract_ticker = ?
-              AND REPLACE(REPLACE(datetime_utc, 'T', ' '), '+00:00', '') >= ?
-              AND REPLACE(REPLACE(datetime_utc, 'T', ' '), '+00:00', '') <= ?
-            ORDER BY datetime_utc
-            """,
-            (continuous_symbol, contract_ticker, start_dt, end_dt),
-        ).fetchall()
-        bars: list[OHLCVBar] = []
-        for ts_raw, o, h, l, c, v in rows:
-            if c is None or c <= 0:
-                continue
-            bars.append(OHLCVBar(
-                timestamp=self._normalize_output_ts(ts_raw),
-                open=o, high=h, low=l, close=c, volume=v or 0,
-            ))
+        history_key = (continuous_symbol, contract_ticker, start_dt)
+        history = self._futures_history_cache.get(history_key)
+        if history is None or end_dt > history[0]:
+            backtest_end = self._normalize_timestamp(
+                self._config.backtest_end, end_of_day=True,
+            )
+            preload_end = max(end_dt, backtest_end)
+            rows = conn.execute(
+                f"""
+                SELECT datetime_utc, open, high, low, close, volume
+                FROM {table}
+                WHERE symbol = ?
+                  AND contract_ticker = ?
+                  AND datetime_utc >= ?
+                  AND datetime_utc <= ?
+                ORDER BY datetime_utc
+                """,
+                (continuous_symbol, contract_ticker, start_dt, preload_end),
+            ).fetchall()
+            all_bars: list[OHLCVBar] = []
+            for ts_raw, o, h, l, c, v in rows:
+                if c is None or c <= 0:
+                    continue
+                all_bars.append(OHLCVBar(
+                    timestamp=self._normalize_output_ts(ts_raw),
+                    open=o, high=h, low=l, close=c, volume=v or 0,
+                ))
+            history = (preload_end, [bar.timestamp for bar in all_bars], all_bars)
+            self._futures_history_cache[history_key] = history
+            self._futures_contract_history_cache[
+                (continuous_symbol, contract_ticker)
+            ] = history
+
+        _, timestamps, all_bars = history
+        end_key = self._normalize_output_ts(end_dt)
+        bars = all_bars[:bisect_right(timestamps, end_key)]
+        self._futures_bars_cache[cache_key] = bars
         return bars
 
     def get_last_completed_futures_bar(
         self, continuous_symbol: str, contract_ticker: str, timestamp: str,
     ) -> OHLCVBar | None:
         """Return the latest bar at or before timestamp for an actual contract."""
+        cache_key = (continuous_symbol, contract_ticker, timestamp)
+        if cache_key in self._futures_last_bar_cache:
+            return self._futures_last_bar_cache[cache_key]
+        history = self._futures_contract_history_cache.get(
+            (continuous_symbol, contract_ticker),
+        )
+        ts = self._normalize_timestamp(timestamp)
+        if history is not None and ts <= history[0]:
+            _, timestamps, bars = history
+            index = bisect_right(timestamps, self._normalize_output_ts(ts)) - 1
+            if index >= 0:
+                self._futures_last_bar_cache[cache_key] = bars[index]
+                return bars[index]
         conn = self._get_conn(Market.FUTURES)
         table = self._config.db_tables[Market.FUTURES]
-        ts = self._normalize_timestamp(timestamp)
         row = conn.execute(
             f"""
             SELECT datetime_utc, open, high, low, close, volume
             FROM {table}
             WHERE symbol = ?
               AND contract_ticker = ?
-              AND REPLACE(REPLACE(datetime_utc, 'T', ' '), '+00:00', '') <= ?
+              AND datetime_utc <= ?
               AND close IS NOT NULL AND close > 0
             ORDER BY datetime_utc DESC
             LIMIT 1
@@ -242,24 +298,39 @@ class MarketDataProvider(IMarketDataProvider):
             (continuous_symbol, contract_ticker, ts),
         ).fetchone()
         if row is None:
+            self._futures_last_bar_cache[cache_key] = None
             return None
         ts_raw, o, h, l, c, v = row
-        return OHLCVBar(self._normalize_output_ts(ts_raw), o, h, l, c, v or 0)
+        bar = OHLCVBar(self._normalize_output_ts(ts_raw), o, h, l, c, v or 0)
+        self._futures_last_bar_cache[cache_key] = bar
+        return bar
 
     def get_next_executable_futures_bar(
         self, continuous_symbol: str, contract_ticker: str, timestamp: str,
     ) -> OHLCVBar | None:
         """Return the first bar strictly after timestamp for next-bar execution."""
+        cache_key = (continuous_symbol, contract_ticker, timestamp)
+        if cache_key in self._futures_next_bar_cache:
+            return self._futures_next_bar_cache[cache_key]
+        history = self._futures_contract_history_cache.get(
+            (continuous_symbol, contract_ticker),
+        )
+        ts = self._normalize_timestamp(timestamp)
+        if history is not None and ts <= history[0]:
+            _, timestamps, bars = history
+            index = bisect_right(timestamps, self._normalize_output_ts(ts))
+            if index < len(bars):
+                self._futures_next_bar_cache[cache_key] = bars[index]
+                return bars[index]
         conn = self._get_conn(Market.FUTURES)
         table = self._config.db_tables[Market.FUTURES]
-        ts = self._normalize_timestamp(timestamp)
         row = conn.execute(
             f"""
             SELECT datetime_utc, open, high, low, close, volume
             FROM {table}
             WHERE symbol = ?
               AND contract_ticker = ?
-              AND REPLACE(REPLACE(datetime_utc, 'T', ' '), '+00:00', '') > ?
+              AND datetime_utc > ?
               AND close IS NOT NULL AND close > 0
             ORDER BY datetime_utc ASC
             LIMIT 1
@@ -267,44 +338,94 @@ class MarketDataProvider(IMarketDataProvider):
             (continuous_symbol, contract_ticker, ts),
         ).fetchone()
         if row is None:
+            self._futures_next_bar_cache[cache_key] = None
             return None
         ts_raw, o, h, l, c, v = row
-        return OHLCVBar(self._normalize_output_ts(ts_raw), o, h, l, c, v or 0)
+        bar = OHLCVBar(self._normalize_output_ts(ts_raw), o, h, l, c, v or 0)
+        self._futures_next_bar_cache[cache_key] = bar
+        return bar
 
     def has_futures_bar_at_or_before(
         self, continuous_symbol: str, contract_ticker: str, timestamp: str,
     ) -> bool:
-        return self.get_last_completed_futures_bar(continuous_symbol, contract_ticker, timestamp) is not None
+        cache_key = (continuous_symbol, contract_ticker)
+        # Fast path: use pre-loaded history cache if available
+        history = self._futures_contract_history_cache.get(cache_key)
+        if history is not None:
+            _, timestamps, _ = history
+            if not timestamps:
+                return False
+            return timestamps[0] <= self._normalize_output_ts(
+                self._normalize_timestamp(timestamp),
+            )
+        if cache_key not in self._futures_first_bar_cache:
+            conn = self._get_conn(Market.FUTURES)
+            table = self._config.db_tables[Market.FUTURES]
+            row = conn.execute(
+                f"""
+                SELECT datetime_utc
+                FROM {table}
+                WHERE symbol = ? AND contract_ticker = ?
+                  AND close IS NOT NULL AND close > 0
+                ORDER BY datetime_utc ASC
+                LIMIT 1
+                """,
+                cache_key,
+            ).fetchone()
+            self._futures_first_bar_cache[cache_key] = row[0] if row else None
+        first_bar_ts = self._futures_first_bar_cache[cache_key]
+        return (
+            first_bar_ts is not None
+            and first_bar_ts <= self._normalize_timestamp(timestamp)
+        )
 
     def get_previous_session_liquidity(
         self, continuous_symbol: str, contract_ticker: str, timestamp: str,
     ) -> tuple[float, float]:
-        """Return dollar volume and volume from the latest completed session before timestamp's date."""
+        """Return dollar volume and volume from the latest completed session before timestamp's date.
+
+        Uses sargable DB query (direct datetime comparison, no SUBSTR) for correctness.
+        dollar_volume from DB is NOT the same as close*volume (uses actual trade prices).
+        """
         conn = self._get_conn(Market.FUTURES)
         table = self._config.db_tables[Market.FUTURES]
         ts = self._normalize_timestamp(timestamp)
         date_part = ts[:10]
-        prev_date = conn.execute(
+        cache_key = (continuous_symbol, contract_ticker, date_part)
+        if cache_key in self._futures_liquidity_cache:
+            return self._futures_liquidity_cache[cache_key]
+
+        # Sargable query: find latest bar before date_part using index
+        row = conn.execute(
             f"""
-            SELECT MAX(SUBSTR(REPLACE(REPLACE(datetime_utc, 'T', ' '), '+00:00', ''), 1, 10))
+            SELECT datetime_utc
             FROM {table}
             WHERE symbol = ? AND contract_ticker = ?
-              AND SUBSTR(REPLACE(REPLACE(datetime_utc, 'T', ' '), '+00:00', ''), 1, 10) < ?
+              AND datetime_utc < ?
+            ORDER BY datetime_utc DESC
+            LIMIT 1
             """,
             (continuous_symbol, contract_ticker, date_part),
-        ).fetchone()[0]
-        if not prev_date:
-            return 0.0, 0.0
+        ).fetchone()
+        if not row:
+            self._futures_liquidity_cache[cache_key] = (0.0, 0.0)
+            return self._futures_liquidity_cache[cache_key]
+        prev_date = self._normalize_output_ts(row[0])[:10]
+        next_date = (
+            datetime.strptime(prev_date, "%Y-%m-%d") + timedelta(days=1)
+        ).strftime("%Y-%m-%d")
         row = conn.execute(
             f"""
             SELECT COALESCE(SUM(dollar_volume), 0), COALESCE(SUM(volume), 0)
             FROM {table}
             WHERE symbol = ? AND contract_ticker = ?
-              AND SUBSTR(REPLACE(REPLACE(datetime_utc, 'T', ' '), '+00:00', ''), 1, 10) = ?
+              AND datetime_utc >= ? AND datetime_utc < ?
             """,
-            (continuous_symbol, contract_ticker, prev_date),
+            (continuous_symbol, contract_ticker, prev_date, next_date),
         ).fetchone()
-        return float(row[0] or 0.0), float(row[1] or 0.0)
+        result = float(row[0] or 0.0), float(row[1] or 0.0)
+        self._futures_liquidity_cache[cache_key] = result
+        return result
 
     @staticmethod
     def _normalize_timestamp(ts: str, end_of_day: bool = False) -> str:
