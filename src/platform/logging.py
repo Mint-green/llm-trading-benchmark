@@ -21,6 +21,7 @@ from src.core.types import (
     PortfolioSnapshot, TradeResult,
 )
 from src.core.interfaces import IExperimentLogger
+from src.core.pricing import compute_total_api_cost
 
 
 class ExperimentLogger(IExperimentLogger):
@@ -31,6 +32,10 @@ class ExperimentLogger(IExperimentLogger):
         self._conn: sqlite3.Connection | None = None
         self._run_id: str | None = None
         self._in_event = False
+        # Accumulators for cost/efficiency computation
+        self._total_prompt_tokens: int = 0
+        self._total_completion_tokens: int = 0
+        self._total_trading_fees: float = 0.0
 
     def init_run(
         self,
@@ -430,6 +435,17 @@ class ExperimentLogger(IExperimentLogger):
         self._ensure_column("run_checkpoints", "previous_checkpoint_hash", "TEXT")
         self._ensure_column("run_checkpoints", "dataset_version", "TEXT")
         self._ensure_column("run_checkpoints", "status", "TEXT")
+        # Enhancement columns for cost/efficiency analytics
+        self._ensure_column("benchmark_runs", "api_cost_total", "REAL DEFAULT 0")
+        self._ensure_column("benchmark_runs", "trading_fees_total", "REAL DEFAULT 0")
+        self._ensure_column("benchmark_runs", "slippage_total", "REAL DEFAULT 0")
+        self._ensure_column("benchmark_runs", "total_cost", "REAL DEFAULT 0")
+        self._ensure_column("benchmark_runs", "total_prompt_tokens", "INTEGER DEFAULT 0")
+        self._ensure_column("benchmark_runs", "total_completion_tokens", "INTEGER DEFAULT 0")
+        self._ensure_column("benchmark_runs", "avg_latency_ms", "REAL DEFAULT 0")
+        self._ensure_column("benchmark_runs", "tokens_per_decision", "REAL DEFAULT 0")
+        self._ensure_column("benchmark_runs", "cost_per_decision", "REAL DEFAULT 0")
+        self._ensure_column("benchmark_runs", "return_per_dollar_cost", "REAL DEFAULT 0")
 
     def _commit(self) -> None:
         if not self._in_event:
@@ -601,6 +617,8 @@ class ExperimentLogger(IExperimentLogger):
         self._commit()
 
     def log_trade(self, result: TradeResult, timestamp: str = "") -> None:
+        if result.success:
+            self._total_trading_fees += result.fees
         self._conn.execute(
             "INSERT INTO trades (run_id, timestamp, symbol, market, side, quantity, price, cost, fees, success, error, metadata) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -618,6 +636,8 @@ class ExperimentLogger(IExperimentLogger):
         prompt_tokens: int, completion_tokens: int, latency_ms: float,
         reasoning: str = "", response: str = "",
     ) -> None:
+        self._total_prompt_tokens += prompt_tokens
+        self._total_completion_tokens += completion_tokens
         self._conn.execute(
             "INSERT INTO llm_calls (run_id, decision_timestamp, round_num, model, prompt_tokens, completion_tokens, total_tokens, latency_ms, reasoning, response) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -765,6 +785,23 @@ class ExperimentLogger(IExperimentLogger):
         self._commit()
 
     def save_results(self, result: BenchmarkResult) -> str:
+        """Save final results with cost and efficiency metrics."""
+        # Compute API cost from accumulated tokens
+        api_cost = compute_total_api_cost(
+            self._total_prompt_tokens, self._total_completion_tokens,
+            result.model_name,
+        )
+        total_cost = api_cost + self._total_trading_fees
+
+        # Compute efficiency metrics
+        decisions_made = max(result.total_decisions, 1)
+        total_tokens = self._total_prompt_tokens + self._total_completion_tokens
+        tokens_per_decision = round(total_tokens / decisions_made, 2)
+        cost_per_decision = round(total_cost / decisions_made, 6)
+        return_usd = result.final_nav - result.initial_nav
+        return_per_dollar = round(return_usd / total_cost, 4) if total_cost > 0 else 0.0
+        avg_latency = self._compute_avg_latency()
+
         result_json = json.dumps({
             "model": result.model_name,
             "total_return": result.total_return,
@@ -772,13 +809,41 @@ class ExperimentLogger(IExperimentLogger):
             "max_drawdown": result.max_drawdown,
             "total_trades": result.total_trades,
             "win_rate": result.win_rate,
+            "api_cost_total": round(api_cost, 4),
+            "trading_fees_total": round(self._total_trading_fees, 4),
+            "total_cost": round(total_cost, 4),
+            "return_per_dollar_cost": return_per_dollar,
+            "tokens_per_decision": tokens_per_decision,
+            "cost_per_decision": cost_per_decision,
         })
+
         self._conn.execute(
-            "UPDATE benchmark_runs SET finished_at = ?, result = ?, status = 'completed', completed_at = ? WHERE run_id = ?",
-            (datetime.now().isoformat(), result_json, datetime.now().isoformat(), self._run_id),
+            """UPDATE benchmark_runs SET
+                finished_at = ?, result = ?, status = 'completed', completed_at = ?,
+                api_cost_total = ?, trading_fees_total = ?, total_cost = ?,
+                total_prompt_tokens = ?, total_completion_tokens = ?,
+                avg_latency_ms = ?,
+                tokens_per_decision = ?, cost_per_decision = ?,
+                return_per_dollar_cost = ?
+            WHERE run_id = ?""",
+            (datetime.now().isoformat(), result_json, datetime.now().isoformat(),
+             round(api_cost, 4), round(self._total_trading_fees, 4), round(total_cost, 4),
+             self._total_prompt_tokens, self._total_completion_tokens,
+             round(avg_latency, 2),
+             tokens_per_decision, cost_per_decision,
+             return_per_dollar,
+             self._run_id),
         )
         self._commit()
         return self._db_path
+
+    def _compute_avg_latency(self) -> float:
+        """Compute average LLM call latency from llm_calls."""
+        row = self._conn.execute(
+            "SELECT AVG(latency_ms) FROM llm_calls WHERE run_id = ?",
+            (self._run_id,),
+        ).fetchone()
+        return row[0] if row and row[0] else 0.0
 
     def load_resume_records(
         self,
