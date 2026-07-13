@@ -134,7 +134,7 @@ class Config:
     """Benchmark configuration. Immutable after creation."""
 
     # --- Data paths ---
-    stock_data_dir: str = "D:/Projects/claw/getStockData/data"
+    stock_data_dir: str = os.path.join(os.path.expanduser("~/Desktop/getStockData"), "data").replace("\\", "/")
 
     # --- Active model ---
     model_name: str = "deepseek-v4-pro"
@@ -179,6 +179,13 @@ class Config:
     deepseek_model: str = "deepseek-v4-pro"
     deepseek_max_tokens: int = 4096
     deepseek_timeout: float = 180.0
+
+    # --- LLM API (qwen) ---
+    qwen_api_key: str = ""
+    qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    qwen_model: str = "qwen-max"
+    qwen_max_tokens: int = 4096
+    qwen_timeout: float = 180.0
 
     # --- Benchmark parameters ---
     backtest_start: str = "2026-02-03"
@@ -329,7 +336,7 @@ class Config:
         model_name = model_cfg.get("name", "mimo-v2.5-pro")
 
         # Build config kwargs
-        base_dir = data_cfg.get("base_dir", "D:/Projects/claw/getStockData")
+        base_dir = data_cfg.get("base_dir", os.path.expanduser("~/Desktop/getStockData"))
         kwargs = {
             # Data
             "stock_data_dir": os.path.join(base_dir, "data").replace("\\", "/"),
@@ -461,6 +468,12 @@ class Config:
         kwargs["deepseek_model"] = "deepseek-v4-pro"
         kwargs["deepseek_max_tokens"] = model_cfg.get("max_tokens", 4096)
         kwargs["deepseek_timeout"] = model_cfg.get("timeout", 180)
+
+        kwargs["qwen_api_key"] = api_cfg.get("qwen_api_key", "")
+        kwargs["qwen_base_url"] = api_cfg.get("qwen_base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+        kwargs["qwen_model"] = model_cfg.get("qwen_model", "qwen-max")
+        kwargs["qwen_max_tokens"] = model_cfg.get("max_tokens", 4096)
+        kwargs["qwen_timeout"] = model_cfg.get("timeout", 180)
 
         return cls(**kwargs)
 
