@@ -892,10 +892,21 @@ class ExperimentRunner:
 
                         price = self._get_price(trade.symbol, trade.market, ts, all_bars)
                         if price:
+                            # Capture position + buy_history BEFORE execution (SELL clears them)
+                            pos_snapshot = None
+                            buy_ts_snapshot = ""
+                            if trade.side == OrderSide.SELL:
+                                key = f"{trade.market.value}:{trade.symbol}"
+                                pos = self.portfolio._positions.get(key)
+                                if pos:
+                                    pos_snapshot = (pos.avg_cost, pos.quantity)
+                                buy_hist = self.settlement._buy_history.get(key, [])
+                                if buy_hist:
+                                    buy_ts_snapshot = buy_hist[0][0]
                             result = self.portfolio.process_order(trade, price, ts)
                             pnl_info = self._compute_trade_pnl(
                                 trade, price, result, ts,
-                                self.portfolio, self.settlement)
+                                pos_snapshot, buy_ts_snapshot)
                             self.logger.log_trade(result, ts, **pnl_info)
                             self._record_execution_memory(result, requested_qty, ts)
                             if result.success:
@@ -1398,10 +1409,13 @@ class ExperimentRunner:
             if self._is_auto_sell_cooling_blocked(key, pos.quantity, snapshot, ts):
                 continue
 
+            key = f"{pos.market.value}:{pos.symbol}"
+            pos_snapshot = (pos.avg_cost, pos.quantity)
+            buy_hist = self.settlement._buy_history.get(key, [])
+            buy_ts = buy_hist[0][0] if buy_hist else ""
             result = self.portfolio.process_order(sell_order, price, ts)
             pnl_info = self._compute_trade_pnl(
-                sell_order, price, result, ts,
-                self.portfolio, self.settlement)
+                sell_order, price, result, ts, pos_snapshot, buy_ts)
             self.logger.log_trade(result, ts, **pnl_info)
             if result.success:
                 auto_sell_feedback.append(
@@ -1855,9 +1869,12 @@ class ExperimentRunner:
 
     @staticmethod
     def _compute_trade_pnl(trade, price: float, result, ts: str,
-                           portfolio: PortfolioEngine,
-                           settlement) -> dict:
-        """Compute P&L info for a trade (relevant for sells)."""
+                           pos_snapshot=None, buy_ts: str = "") -> dict:
+        """Compute P&L info for a trade (relevant for sells).
+
+        pos_snapshot: (avg_cost, quantity) captured BEFORE execution.
+        buy_ts: captured BEFORE execution (settlement clears on sell).
+        """
         info = {"buy_timestamp": "", "holding_minutes": 0,
                 "realized_pnl": 0.0, "realized_pnl_pct": 0.0, "rejection_code": ""}
         if not result.success:
@@ -1867,10 +1884,7 @@ class ExperimentRunner:
         if trade.side != OrderSide.SELL:
             return info
 
-        key = f"{trade.market.value}:{trade.symbol}"
-        buy_history = settlement._buy_history.get(key, [])
-        if buy_history:
-            buy_ts = buy_history[0][0]
+        if buy_ts:
             info["buy_timestamp"] = buy_ts
             try:
                 from datetime import datetime
@@ -1880,11 +1894,10 @@ class ExperimentRunner:
             except (ValueError, TypeError):
                 pass
 
-            pos = portfolio._positions.get(key)
-            if pos and pos.avg_cost > 0:
-                price_usd = price  # price is already local currency in execution
-                realized_pnl = (price_usd - pos.avg_cost) * result.order.quantity
-                realized_pnl_pct = (price_usd - pos.avg_cost) / pos.avg_cost * 100
+            avg_cost = pos_snapshot[0] if pos_snapshot else None
+            if avg_cost and avg_cost > 0:
+                realized_pnl = (price - avg_cost) * result.order.quantity
+                realized_pnl_pct = (price - avg_cost) / avg_cost * 100
                 info["realized_pnl"] = round(realized_pnl, 2)
                 info["realized_pnl_pct"] = round(realized_pnl_pct, 4)
 
