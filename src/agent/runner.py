@@ -51,6 +51,14 @@ class AgentRunner(IAgentRunner):
             )
             self._api_model = config.deepseek_model
             self._max_tokens = config.deepseek_max_tokens
+        elif "qwen" in model:
+            self._client = OpenAI(
+                api_key=config.qwen_api_key,
+                base_url=config.qwen_base_url,
+                timeout=config.qwen_timeout,
+            )
+            self._api_model = config.qwen_model
+            self._max_tokens = config.qwen_max_tokens
         else:
             # Default to mimo-pro
             self._client = OpenAI(
