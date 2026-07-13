@@ -446,6 +446,12 @@ class ExperimentLogger(IExperimentLogger):
         self._ensure_column("benchmark_runs", "tokens_per_decision", "REAL DEFAULT 0")
         self._ensure_column("benchmark_runs", "cost_per_decision", "REAL DEFAULT 0")
         self._ensure_column("benchmark_runs", "return_per_dollar_cost", "REAL DEFAULT 0")
+        # Trade P&L tracking columns
+        self._ensure_column("trades", "rejection_code", "TEXT DEFAULT ''")
+        self._ensure_column("trades", "buy_timestamp", "TEXT DEFAULT ''")
+        self._ensure_column("trades", "holding_minutes", "INTEGER DEFAULT 0")
+        self._ensure_column("trades", "realized_pnl", "REAL DEFAULT 0")
+        self._ensure_column("trades", "realized_pnl_pct", "REAL DEFAULT 0")
 
     def _commit(self) -> None:
         if not self._in_event:
