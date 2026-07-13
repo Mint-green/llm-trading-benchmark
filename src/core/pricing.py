@@ -24,6 +24,21 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
         "output": 2.19,
         "provider": "Xiaomi MIMO",
     },
+    "qwen-max": {
+        "input": 0.17,     # ¥1.2/1M ≈ $0.17 (7.25 FX)
+        "output": 0.99,    # ¥7.2/1M ≈ $0.99
+        "provider": "Alibaba Bailian",
+    },
+    "qwen-flash": {
+        "input": 0.17,     # ¥1.2/1M ≈ $0.17
+        "output": 0.99,    # ¥7.2/1M ≈ $0.99
+        "provider": "Alibaba Bailian",
+    },
+    "qwen3.6-max": {
+        "input": 1.24,     # ¥9/1M ≈ $1.24
+        "output": 7.45,    # ¥54/1M ≈ $7.45
+        "provider": "Alibaba Bailian",
+    },
 }
 
 DEFAULT_PRICING = {"input": 0.50, "output": 1.50}
