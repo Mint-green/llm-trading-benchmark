@@ -267,19 +267,14 @@ class ExperimentRunner:
             run_metadata = self.logger.get_current_run()
             if checkpoint["dataset_version"] != self._version_metadata.dataset_version:
                 raise ValueError("Resume dataset version does not match the checkpoint")
-            if self._extend:
-                # Extend only changes end_date — code/prompt/tool versions may differ
-                pass
-            else:
-                # Resume requires exact version match
-                if checkpoint["code_version"] != self._version_metadata.code_version:
-                    raise ValueError("Resume code version does not match the checkpoint")
-                for field, expected in (
-                    ("prompt_version", self._version_metadata.prompt_version),
-                    ("tool_version", self._version_metadata.tool_version),
-                ):
-                    if run_metadata.get(field) != expected:
-                        raise ValueError(f"Resume {field} does not match the run")
+            if checkpoint["code_version"] != self._version_metadata.code_version:
+                raise ValueError("Resume code version does not match the checkpoint")
+            for field, expected in (
+                ("prompt_version", self._version_metadata.prompt_version),
+                ("tool_version", self._version_metadata.tool_version),
+            ):
+                if run_metadata.get(field) != expected:
+                    raise ValueError(f"Resume {field} does not match the run")
             if self._extend:
                 old_config = json.loads(run_metadata["config"])
                 old_comparable = dict(old_config)
@@ -290,7 +285,7 @@ class ExperimentRunner:
                     raise ValueError(
                         "Extend may only change the backtest end date"
                     )
-                if self.config.backtest_end < run_metadata["end_date"]:
+                if self.config.backtest_end <= run_metadata["end_date"]:
                     raise ValueError("Extend end date must be later than the run end")
                 self.logger.prepare_extend(
                     config_dict=self._config_dict,
@@ -898,7 +893,10 @@ class ExperimentRunner:
                         price = self._get_price(trade.symbol, trade.market, ts, all_bars)
                         if price:
                             result = self.portfolio.process_order(trade, price, ts)
-                            self.logger.log_trade(result, ts)
+                            pnl_info = self._compute_trade_pnl(
+                                trade, price, result, ts,
+                                self.portfolio, self.settlement)
+                            self.logger.log_trade(result, ts, **pnl_info)
                             self._record_execution_memory(result, requested_qty, ts)
                             if result.success:
                                 executed_qty = result.order.quantity
@@ -1401,7 +1399,10 @@ class ExperimentRunner:
                 continue
 
             result = self.portfolio.process_order(sell_order, price, ts)
-            self.logger.log_trade(result, ts)
+            pnl_info = self._compute_trade_pnl(
+                sell_order, price, result, ts,
+                self.portfolio, self.settlement)
+            self.logger.log_trade(result, ts, **pnl_info)
             if result.success:
                 auto_sell_feedback.append(
                     f"AUTO SELL {pos.symbol}({pos.market.value}): PnL={pnl_pct*100:.1f}% hit stop-loss"
@@ -1851,3 +1852,40 @@ class ExperimentRunner:
     @staticmethod
     def _market_currency(market: Market) -> str:
         return {Market.US: "USD", Market.HK: "HKD", Market.CN: "CNY", Market.CRYPTO: "USD", Market.GOLD: "USD", Market.FUTURES: "USD"}.get(market, "USD")
+
+    @staticmethod
+    def _compute_trade_pnl(trade, price: float, result, ts: str,
+                           portfolio: PortfolioEngine,
+                           settlement) -> dict:
+        """Compute P&L info for a trade (relevant for sells)."""
+        info = {"buy_timestamp": "", "holding_minutes": 0,
+                "realized_pnl": 0.0, "realized_pnl_pct": 0.0, "rejection_code": ""}
+        if not result.success:
+            from src.core.pricing import classify_rejection
+            info["rejection_code"] = classify_rejection(result.error or "")
+            return info
+        if trade.side != OrderSide.SELL:
+            return info
+
+        key = f"{trade.market.value}:{trade.symbol}"
+        buy_history = settlement._buy_history.get(key, [])
+        if buy_history:
+            buy_ts = buy_history[0][0]
+            info["buy_timestamp"] = buy_ts
+            try:
+                from datetime import datetime
+                buy_dt = datetime.strptime(buy_ts[:16], "%Y-%m-%d %H:%M")
+                sell_dt = datetime.strptime(ts[:16], "%Y-%m-%d %H:%M")
+                info["holding_minutes"] = int((sell_dt - buy_dt).total_seconds() / 60)
+            except (ValueError, TypeError):
+                pass
+
+            pos = portfolio._positions.get(key)
+            if pos and pos.avg_cost > 0:
+                price_usd = price  # price is already local currency in execution
+                realized_pnl = (price_usd - pos.avg_cost) * result.order.quantity
+                realized_pnl_pct = (price_usd - pos.avg_cost) / pos.avg_cost * 100
+                info["realized_pnl"] = round(realized_pnl, 2)
+                info["realized_pnl_pct"] = round(realized_pnl_pct, 4)
+
+        return info
