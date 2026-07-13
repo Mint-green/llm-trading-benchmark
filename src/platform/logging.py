@@ -622,18 +622,24 @@ class ExperimentLogger(IExperimentLogger):
         )
         self._commit()
 
-    def log_trade(self, result: TradeResult, timestamp: str = "") -> None:
+    def log_trade(self, result: TradeResult, timestamp: str = "",
+                  buy_timestamp: str = "", holding_minutes: int = 0,
+                  realized_pnl: float = 0.0, realized_pnl_pct: float = 0.0,
+                  rejection_code: str = "") -> None:
         if result.success:
             self._total_trading_fees += result.fees
         self._conn.execute(
-            "INSERT INTO trades (run_id, timestamp, symbol, market, side, quantity, price, cost, fees, success, error, metadata) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO trades (run_id, timestamp, symbol, market, side, quantity, "
+            "price, cost, fees, success, error, metadata, "
+            "rejection_code, buy_timestamp, holding_minutes, realized_pnl, realized_pnl_pct) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (self._run_id, timestamp,
              result.order.symbol, result.order.market.value,
              result.order.side.value, result.order.quantity,
              result.price, result.cost, result.fees,
              1 if result.success else 0, result.error,
-             json.dumps(result.metadata, ensure_ascii=False)),
+             json.dumps(result.metadata, ensure_ascii=False),
+             rejection_code, buy_timestamp, holding_minutes, realized_pnl, realized_pnl_pct),
         )
         self._commit()
 
