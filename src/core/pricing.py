@@ -52,6 +52,38 @@ def get_pricing(model_name: str) -> dict[str, float]:
     return dict(DEFAULT_PRICING)
 
 
+def classify_rejection(error_message: str) -> str:
+    """Classify a rejection error message into a standardized code."""
+    if not error_message:
+        return ""
+    msg = error_message.lower()
+    if "market" in msg and ("closed" in msg or "rule" in msg):
+        return "MARKET_CLOSED"
+    if "daily" in msg and "limit" in msg:
+        return "DAILY_LIMIT"
+    if "cooling" in msg:
+        return "COOLING_PERIOD"
+    if "position" in msg and "limit" in msg:
+        return "POSITION_LIMIT"
+    if "market exposure" in msg:
+        return "MARKET_EXPOSURE"
+    if "cash" in msg and ("reserve" in msg or "5%" in msg):
+        return "CASH_RESERVE"
+    if "t+1" in msg.lower():
+        return "T1_RESTRICTION"
+    if "rounds to 0" in msg or "lot" in msg:
+        return "LOT_ROUNDING"
+    if "sell" in msg and ("limit" in msg or "max" in msg):
+        return "SELL_LIMIT"
+    if "insufficient" in msg:
+        return "INSUFFICIENT_FUNDS"
+    if "price" in msg and "unavailable" in msg:
+        return "PRICE_UNAVAILABLE"
+    if "notional_too_small" in msg or "contract" in msg:
+        return "CONTRACT_SIZE"
+    return "OTHER"
+
+
 def compute_api_cost(
     prompt_tokens: int, completion_tokens: int, model_name: str,
 ) -> float:
